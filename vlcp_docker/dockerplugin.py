@@ -36,6 +36,7 @@ def _routeapi(path):
                 for m in env.inputstream.read(self):
                     yield m
                 params = json.loads(_str(self.data, charset), charset)
+                self._logger.debug('Call %r with parameters: %r', path, params)
                 r = func(self, env, params)
                 if r is not None:
                     for m in r:
@@ -56,7 +57,7 @@ def _create_veth(ip_command, prefix, mac_address):
         device_name = prefix + str(random.randrange(1, 1000000))
         try:
             subprocess.check_call([ip_command, "link", "add", device_name]
-                                  + ["address", mac_address] if mac_address else []
+                                  + (["address", mac_address] if mac_address else [])
                                   + ["type", "veth", "peer", "name", device_name + "-tap"])
         except Exception as exc:
             last_exc = exc
@@ -70,6 +71,7 @@ def _create_veth(ip_command, prefix, mac_address):
     if not m:
         raise ValueError('Cannot create interface')
     mac_address = m.group(1)
+    subprocess.check_call([ip_command, "link", "set", device_name + "-tap", "up"])
     return (device_name, mac_address)
 
 def _delete_veth(ip_command, device_name):
@@ -97,14 +99,16 @@ class NetworkPlugin(HttpHandler):
     def createnetwork(self, env, params):
         lognet_id = 'docker-' + params['NetworkID'] + '-lognet'
         network_params = {'id': lognet_id}
-        network_params.update(params['Options'])
-        for m in callAPI(self, 'viperflow', 'createnetwork', network_params):
+        if 'Options' in params and 'com.docker.network.generic' in params['Options']:
+            network_params.update(params['Options']['com.docker.network.generic'])
+        for m in callAPI(self, 'viperflow', 'createlogicalnetwork', network_params):
             yield m
         subnet_params = {'logicalnetwork': lognet_id,
-                        'cidr': params['IPv4Data']['Pool'],
+                        'cidr': params['IPv4Data'][0]['Pool'],
                         'id': 'docker-' + params['NetworkID'] + '-subnet'}
-        if 'Gateway' in params['IPv4Data']:
-            subnet_params['gateway'] = params['IPv4Data']['Gateway']
+        if params['IPv4Data'] and 'Gateway' in params['IPv4Data'][0]:
+            gateway, _, _ = params['IPv4Data'][0]['Gateway'].rpartition('/')
+            subnet_params['gateway'] = gateway
         try:
             for m in callAPI(self, 'viperflow', 'createsubnet', subnet_params):
                 yield m
@@ -136,9 +140,10 @@ class NetworkPlugin(HttpHandler):
         mac_address = None
         if 'Interface' in params:
             interface = params['Interface']
-            if 'Address' in interface:
-                logport_params['ip_address'] = interface['Address']
-            if 'MacAddress' in interface:
+            if 'Address' in interface and interface['Address']:
+                ip,f,prefix = interface['Address'].rpartition('/')
+                logport_params['ip_address'] = ip
+            if 'MacAddress' in interface and interface['MacAddress']:
                 logport_params['mac_address'] = interface['MacAddress']
                 mac_address = interface['MacAddress']
         for m in callAPI(self, 'viperflow', 'createlogicalport', logport_params):
@@ -158,12 +163,17 @@ class NetworkPlugin(HttpHandler):
             for m in callAPI(self, 'viperflow', 'updatelogicalport', update_params):
                 yield m
             ip_address = self.retvalue[0]['ip_address']
+            subnet_cidr = self.retvalue[0]['subnet']['cidr']
+            _, _, prefix = subnet_cidr.partition('/')
             for m in self._parent.taskpool.runTask(self, lambda: _plug_ovs(self._parent.ovscommand,
                                                                           self._parent.ovsbridge,
                                                                           device_name,
                                                                           logport_id)):
                 yield m
-            env.outputjson({'Interface':{'MacAddress': mac_address, 'Address': ip_address}})
+            result = {'Interface':{'MacAddress': mac_address}}
+            if 'Address' not in interface:
+                result['Interface']['Address'] = ip_address + '/' + prefix
+            env.outputjson(result)
         except Exception as exc:
             try:
                 if port_created:
@@ -190,13 +200,15 @@ class NetworkPlugin(HttpHandler):
             raise KeyError(repr(params['EndpointID']) + ' not found')
         logport_result = self.retvalue[0]
         docker_port = logport_result['docker_port']
-        def _unplug_port(ovs_command = self.parent.ovscommand,
-                         bridge_name = self.parent.ovsbridge,
+        def _unplug_port(ovs_command = self._parent.ovscommand,
+                         bridge_name = self._parent.ovsbridge,
                          device_name = docker_port,
-                         ip_command = self.parent.ipcommand):
+                         ip_command = self._parent.ipcommand):
             _unplug_ovs(ovs_command, bridge_name, device_name)
             _delete_veth(ip_command, device_name)
-        for m in self.parent.taskpool.runTask(self, _unplug_port):
+        for m in self._parent.taskpool.runTask(self, _unplug_port):
+            yield m
+        for m in callAPI(self, 'viperflow', 'deletelogicalport', {'id': logport_id}):
             yield m
         env.outputjson({})
     @_routeapi(b'/NetworkDriver.Join')
@@ -209,7 +221,7 @@ class NetworkPlugin(HttpHandler):
         logport_result = self.retvalue[0]
         docker_port = logport_result['docker_port']
         result = {'InterfaceName': {'SrcName': docker_port,
-                                    'DstPrefix': self.parent.dstprefix}}
+                                    'DstPrefix': self._parent.dstprefix}}
         if 'subnet' in logport_result:
             subnet = logport_result['subnet']
             if 'gateway' in subnet:
