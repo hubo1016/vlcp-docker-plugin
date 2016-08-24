@@ -89,7 +89,10 @@ For VLCP API (on any node):
 curl -g 'http://localhost:8081/viperflow/createphysicalnetwork?type=vlan&vlanrange=`[[1000,1100]]`&id=vlan'
 curl -g 'http://localhost:8081/viperflow/createphysicalport?physicalnetwork=vlan&name=trunk0'
 ```
-Replace [1000,1100] to your vlan tag range ([[begin1, end1], [begin2, end2]])
+Replace [1000,1100] to your vlan tag range ([[begin1, end1], [begin2, end2]]). 'vlan' is the physicalnetwork id,
+you may replace it with any string you like, or remove the parameter and let VLCP generate an UUID for you.
+For Docker integration, since usually you do not have many physical networks, it is always simplier to use
+a meanful name instead of an UUID.
 
 #### VXLAN (overlay) networks
 
@@ -97,10 +100,63 @@ For OpenvSwitch:
 ```bash
 ovs-vsctl add-port dockerbr0 vxlan0 -- set interface vxlan0 type=vxlan options:local_ip=10.9.1.2 options:remote_ip=flow
 ```
-replace '10.9.1.2' to your node's IP address.
+Replace '10.9.1.2' to your node's IP address. Correctly configuring the endpoint IP address is the key for
+VLCP overlay network, it should be different for every node, you can obtain the IP address from
+an piece of bash script.
+
 For VLCP API (on any node):
 ```bash
 curl -g 'http://localhost:8081/viperflow/createphysicalnetwork?type=vxlan&vnirange=`[[10000,11000]]`&id=vxlan'
 curl -g 'http://localhost:8081/viperflow/createphysicalport?physicalnetwork=vxlan&name=vxlan0'
 ```
 Replace [[10000,11000]] to your vni range ([[begin1, end1], [begin2, end2]])
+
+#### Bridge network
+
+Assume eth0 is the port with external network that you want to bridge to. 
+
+**WARNING: bridging the NIC your management IP address is on DISCONNECT YOUR SERVER from network. NEVER DO THAT.
+Always use a separated NIC which does not break your management network.**
+
+For OpenvSwitch:
+```bash
+ovs-vsctl add-port dockerbr0 eth0
+```
+
+For VLCP API (on any node):
+```bash
+curl -g 'http://localhost:8081/viperflow/createphysicalnetwork?type=native&id=native'
+curl -g 'http://localhost:8081/viperflow/createphysicalport?physicalnetwork=native&name=eth0'
+```
+
+#### Host local network
+
+Host local networks do not have physical port for external connection, so they are only connected in the same host. 
+
+For VLCP API (on any node):
+```bash
+curl -g 'http://localhost:8081/viperflow/createphysicalnetwork?type=local&id=local'
+```
+
+### Create networks in Docker
+```bash
+docker network create -d vlcp --subnet 192.168.1.0/24 --ip-range 192.168.1.64/28 --gateway 192.168.1.1 --internal -o physicalnetwork=vlan vlcp_network
+```
+-d vlcp specify the network plugin to be VLCP. Other options are:
+  + --subnet: The subnet CIDR
+  + --ip-range: A CIDR which ip address can be allocated from. If not specified *subnet* is used.
+  + --gateway: Default gateway for this network
+  + --internal: Do not use docker default bridge network. It is necessary if you want the SDN network to provide L3 routing and external
+  network access. If you want to use docker built-in NAT and PAT access, remove this option.
+  + -o specify the ID of physical network you created earlier. Also, use additional -o to provide other options:
+    + -o vlan=*vlantag*: For VLAN-tagged network, specify the network VLAN tag
+    + -o vni=*vni*: For VXLAN overlay network, specify the VNI.
+  + 'vlcp_network': the docker network name, replace this to any name you preferred.
+
+### Create container connecting to VLCP networks in docker
+```bash
+docker create --network vlcp_network --ip 192.168.1.65 ...
+```
+Use --network to specify vlcp_network (or any name you decided earlier). Use --ip to choose an IP address manually, if not specified,
+docker chhoses an IP address automatically from the ip-range. Other parameters are the same as normal docker create.
+*docker run* has the same parameters.
