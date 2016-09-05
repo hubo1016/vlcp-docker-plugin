@@ -98,7 +98,7 @@ a meanful name instead of an UUID.
 
 For OpenvSwitch:
 ```bash
-ovs-vsctl add-port dockerbr0 vxlan0 -- set interface vxlan0 type=vxlan options:local_ip=10.9.1.2 options:remote_ip=flow
+ovs-vsctl add-port dockerbr0 vxlan0 -- set interface vxlan0 type=vxlan options:local_ip=10.9.1.2 options:remote_ip=flow options:key=flow
 ```
 Replace '10.9.1.2' to your node's IP address. Correctly configuring the endpoint IP address is the key for
 VLCP overlay network, it should be different for every node, you can obtain the IP address from
