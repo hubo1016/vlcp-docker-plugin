@@ -3,7 +3,7 @@ Created on 2016/8/22
 
 :author: hubo
 '''
-from vlcp.server.module import Module, callAPI, depend
+from vlcp.server.module import Module, callAPI, depend, api
 import vlcp.service.connection.httpserver as httpserver
 import vlcp.service.sdn.viperflow as viperflow
 from vlcp.utils.connector import TaskPool
@@ -13,7 +13,21 @@ from email.message import Message
 import json
 import functools
 import re
-from vlcp.utils.ethernet import ip4_addr
+from vlcp.utils.ethernet import ip4_addr, mac_addr
+from vlcp.utils.dataobject import DataObject, watch_context, dump, updater,\
+    set_new
+import vlcp.service.kvdb.objectdb as objectdb
+from vlcp.event.runnable import RoutineContainer
+from namedstruct.stdprim import create_binary, uint64
+from vlcp.utils.ethernet import mac_addr_bytes
+from random import randint
+from vlcp.utils.networkmodel import LogicalPort
+
+class DockerInfo(DataObject):
+    _prefix = 'viperflow.dockerplugin.portinfo'
+    _indices = ("id",)
+
+LogicalPort._register_auto_remove('DockerInfo', lambda x: [DockerInfo.default_key(x.id)])
 
 def _str(b, encoding = 'ascii'):
     if isinstance(b, str):
@@ -89,6 +103,7 @@ class NetworkPlugin(HttpHandler):
         HttpHandler.__init__(self, parent.scheduler, False, parent.vhostbind)
         self._parent = parent
         self._logger = parent._logger
+        self._macbase = uint64.create(create_binary(mac_addr_bytes(self._parent.mactemplate), 8))
     @HttpHandler.route(b'/Plugin.Activate', method = [b'POST'])
     def plugin_activate(self, env):
         env.outputjson({"Implements": ["NetworkDriver"]})
@@ -143,11 +158,30 @@ class NetworkPlugin(HttpHandler):
             if 'Address' in interface and interface['Address']:
                 ip,f,prefix = interface['Address'].rpartition('/')
                 logport_params['ip_address'] = ip
+            else:
+                ip = None
             if 'MacAddress' in interface and interface['MacAddress']:
                 logport_params['mac_address'] = interface['MacAddress']
                 mac_address = interface['MacAddress']
+        if mac_address is None:
+            # Generate a MAC address
+            if ip:
+                # Generate MAC address based on IP address
+                mac_num = self._macbase
+                mac_num ^= ((hash(subnet_id) & 0xffffffff) << 8)
+                mac_num ^= ip4_addr(ip)
+            else:
+                # Generate MAC address based on Port ID and random number
+                mac_num = self._macbase
+                mac_num ^= ((hash(logport_id) & 0xffffffff) << 8)
+                mac_num ^= randint(0, 0xffffffff)
+            mac_address = mac_addr_bytes.formatter(create_binary(mac_num, 6))
+            logport_params['mac_address'] = mac_address
         for m in callAPI(self, 'viperflow', 'createlogicalport', logport_params):
             yield m
+        ip_address = self.retvalue[0]['ip_address']
+        subnet_cidr = self.retvalue[0]['subnet']['cidr']
+        _, _, prefix = subnet_cidr.partition('/')
         port_created = False
         try:
             for m in self._parent.taskpool.runTask(self, lambda: _create_veth(self._parent.ipcommand,
@@ -155,16 +189,16 @@ class NetworkPlugin(HttpHandler):
                                                                              mac_address)):
                 yield m
             port_created = True
-            device_name, mac_address2 = self.retvalue
-            update_params = {'id': logport_id, 'docker_port': device_name}
-            if not mac_address:
-                mac_address = mac_address2
-                update_params['mac_address'] = mac_address2
-            for m in callAPI(self, 'viperflow', 'updatelogicalport', update_params):
+            device_name, _ = self.retvalue
+            info = DockerInfo.create_instance(logport_id)
+            info.docker_port = device_name
+            @updater
+            def _updater(dockerinfo):
+                dockerinfo = set_new(dockerinfo, info)
+                return (dockerinfo,)
+            for m in callAPI(self, 'objectdb', 'transact', {'keys': (info.getkey(),),
+                                                            'updater': _updater}):
                 yield m
-            ip_address = self.retvalue[0]['ip_address']
-            subnet_cidr = self.retvalue[0]['subnet']['cidr']
-            _, _, prefix = subnet_cidr.partition('/')
             for m in self._parent.taskpool.runTask(self, lambda: _plug_ovs(self._parent.ovscommand,
                                                                           self._parent.ovsbridge,
                                                                           device_name,
@@ -194,12 +228,12 @@ class NetworkPlugin(HttpHandler):
     @_routeapi(b'/NetworkDriver.DeleteEndpoint')
     def delete_endpoint(self, env, params):
         logport_id = 'docker-' + params['EndpointID']
-        for m in callAPI(self, 'viperflow', 'listlogicalports', {'id': logport_id}):
+        for m in callAPI(self, 'dockerplugin', 'getdockerinfo', {'portid': logport_id}):
             yield m
         if not self.retvalue:
             raise KeyError(repr(params['EndpointID']) + ' not found')
-        logport_result = self.retvalue[0]
-        docker_port = logport_result['docker_port']
+        dockerinfo_result = self.retvalue[0]
+        docker_port = dockerinfo_result['docker_port']
         def _unplug_port(ovs_command = self._parent.ovscommand,
                          bridge_name = self._parent.ovsbridge,
                          device_name = docker_port,
@@ -214,12 +248,17 @@ class NetworkPlugin(HttpHandler):
     @_routeapi(b'/NetworkDriver.Join')
     def endpoint_join(self, env, params):
         logport_id = 'docker-' + params['EndpointID']
-        for m in callAPI(self, 'viperflow', 'listlogicalports', {'id': logport_id}):
+        for m in self.executeAll([callAPI(self, 'viperflow', 'listlogicalports', {'id': logport_id}),
+                                  callAPI(self, 'dockerplugin', 'getdockerinfo', {'portid': logport_id})]):
             yield m
-        if not self.retvalue:
+        ((logport_results,),(dockerinfo_results,)) = self.retvalue
+        if not logport_results:
             raise KeyError(repr(params['EndpointID']) + ' not found')
-        logport_result = self.retvalue[0]
-        docker_port = logport_result['docker_port']
+        logport_result = logport_results[0]
+        if dockerinfo_results:
+            docker_port = dockerinfo_results[0]['docker_port']
+        else:
+            docker_port = logport_result['docker_port']
         result = {'InterfaceName': {'SrcName': docker_port,
                                     'DstPrefix': self._parent.dstprefix}}
         if 'subnet' in logport_result:
@@ -239,15 +278,30 @@ class NetworkPlugin(HttpHandler):
                                               for r in subnet['host_routes']]
                 except Exception:
                     self._logger.warning('Generate static routes failed', exc_info = True)
-        for m in callAPI(self, 'viperflow', 'updatelogicalport', {'id': logport_id,
-                                                                  'docker_sandbox': params['SandboxKey']}):
+        sandboxkey = params['SandboxKey']
+        @updater
+        def _updater(dockerinfo):
+            if dockerinfo is None:
+                return ()
+            else:
+                dockerinfo.docker_sandbox = sandboxkey
+                return (dockerinfo,)
+        for m in callAPI(self, 'objectdb', 'transact', {'keys': [DockerInfo.default_key(logport_id)],
+                                                        'updater': _updater}):
             yield m
         env.outputjson(result)
     @_routeapi(b'/NetworkDriver.Leave')
     def endpoint_leave(self, env, params):
         logport_id = 'docker-' + params['EndpointID']
-        for m in callAPI(self, 'viperflow', 'updatelogicalport', {'id': logport_id,
-                                                                  'docker_sandbox': None}):
+        @updater
+        def _updater(dockerinfo):
+            if dockerinfo is None:
+                return ()
+            else:
+                dockerinfo.docker_sandbox = None
+                return (dockerinfo,)
+        for m in callAPI(self, 'objectdb', 'transact', {'keys': [DockerInfo.default_key(logport_id)],
+                                                        'updater': _updater}):
             yield m
         env.outputjson({})
     @_routeapi(b'/NetworkDriver.DiscoverNew')
@@ -258,7 +312,7 @@ class NetworkPlugin(HttpHandler):
         env.outputjson({})
     
 @defaultconfig
-@depend(httpserver.HttpServer, viperflow.ViperFlow)
+@depend(httpserver.HttpServer, viperflow.ViperFlow, objectdb.ObjectDB)
 class DockerPlugin(Module):
     _default_vhostbind = 'docker'
     _default_ovsbridge = 'dockerbr0'
@@ -266,10 +320,32 @@ class DockerPlugin(Module):
     _default_ipcommand = 'ip'
     _default_ovscommand = 'ovs-vsctl'
     _default_dstprefix = 'eth'
+    _default_mactemplate = '02:00:00:00:00:00'
     def __init__(self, server):
         Module.__init__(self, server)
         taskpool = TaskPool(self.scheduler)
         self.taskpool = taskpool
         self.routines.append(self.taskpool)
         self.routines.append(NetworkPlugin(self))
+        self.apiroutine = RoutineContainer(self.scheduler)
+        self._reqid = 0
+        self.createAPI(api(self.getdockerinfo, self.apiroutine))
+    def _dumpkeys(self, keys):
+        self._reqid += 1
+        reqid = ('dockerplugin',self._reqid)
+
+        for m in callAPI(self.apiroutine,'objectdb','mget',{'keys':keys,'requestid':reqid}):
+            yield m
+
+        retobjs = self.apiroutine.retvalue
+
+        with watch_context(keys,retobjs,reqid,self.apiroutine):
+            self.apiroutine.retvalue = [dump(v) for v in retobjs]
+    def getdockerinfo(self, portid):
+        if not isinstance(portid, str) and hasattr(portid, '__iter__'):
+            for m in self._dumpkeys([DockerInfo.default_key(p) for p in portid]):
+                yield m
+        else:            
+            for m in self._dumpkeys([DockerInfo.default_key(portid)]):
+                yield m
     
