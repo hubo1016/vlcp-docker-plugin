@@ -11,7 +11,7 @@ except:
     pass
 from setuptools import setup, find_packages
 
-VERSION = '0.0.1'
+VERSION = '0.0.2'
 
 setup(name='vlcp-docker-plugin',
       version=VERSION,
@@ -23,5 +23,5 @@ setup(name='vlcp-docker-plugin',
       keywords=['SDN', 'VLCP', 'docker'],
       test_suite = 'tests',
       use_2to3=False,
-      install_requires = ["vlcp>=1.0.4"],
+      install_requires = ["vlcp>=1.0.9"],
       packages=find_packages(exclude=("tests","tests.*","misc","misc.*")))
