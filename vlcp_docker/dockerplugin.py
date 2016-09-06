@@ -22,6 +22,7 @@ from namedstruct.stdprim import create_binary, uint64
 from vlcp.utils.ethernet import mac_addr_bytes
 from random import randint
 from vlcp.utils.networkmodel import LogicalPort
+import ast
 
 class DockerInfo(DataObject):
     _prefix = 'viperflow.dockerplugin.portinfo'
@@ -65,14 +66,16 @@ def _routeapi(path):
 import subprocess
 import random
 
-def _create_veth(ip_command, prefix, mac_address):
+def _create_veth(ip_command, prefix, mac_address, mtu):
     last_exc = None
     for _ in range(0, 3):
         device_name = prefix + str(random.randrange(1, 1000000))
         try:
             subprocess.check_call([ip_command, "link", "add", device_name]
                                   + (["address", mac_address] if mac_address else [])
-                                  + ["type", "veth", "peer", "name", device_name + "-tap"])
+                                  + (["mtu", str(mtu)] if mtu is not None else [])
+                                  + ["type", "veth", "peer", "name", device_name + "-tap"]
+                                  + (["mtu", str(mtu)] if mtu is not None else []))
         except Exception as exc:
             last_exc = exc
         else:
@@ -115,7 +118,18 @@ class NetworkPlugin(HttpHandler):
         lognet_id = 'docker-' + params['NetworkID'] + '-lognet'
         network_params = {'id': lognet_id}
         if 'Options' in params and 'com.docker.network.generic' in params['Options']:
-            network_params.update(params['Options']['com.docker.network.generic'])
+            for k,v in params['Options']['com.docker.network.generic'].items():
+                if k.startswith('subnet:'):
+                    pass
+                elif k in ('mtu','vlanid','vni'):
+                    network_params[k] = int(v)
+                elif v[:1] == '`' and v[-1:] == '`':
+                    try:
+                        network_params[k] = ast.literal_eval(v[1:-1])
+                    except Exception:
+                        network_params[k] = v
+                else:
+                    network_params[k] = v
         for m in callAPI(self, 'viperflow', 'createlogicalnetwork', network_params):
             yield m
         subnet_params = {'logicalnetwork': lognet_id,
@@ -124,6 +138,17 @@ class NetworkPlugin(HttpHandler):
         if params['IPv4Data'] and 'Gateway' in params['IPv4Data'][0]:
             gateway, _, _ = params['IPv4Data'][0]['Gateway'].rpartition('/')
             subnet_params['gateway'] = gateway
+        if 'Options' in params and 'com.docker.network.generic' in params['Options']:
+            for k,v in params['Options']['com.docker.network.generic'].items():
+                if k.startswith('subnet:'):
+                    subnet_key = k[len('subnet:'):]
+                    if v[:1] == '`' and v[-1:] == '`':
+                        try:
+                            subnet_params[subnet_key] = ast.literal_eval(v[1:-1])
+                        except Exception:
+                            subnet_params[subnet_key] = v
+                    else:
+                        subnet_params[subnet_key] = v
         try:
             for m in callAPI(self, 'viperflow', 'createsubnet', subnet_params):
                 yield m
@@ -181,12 +206,14 @@ class NetworkPlugin(HttpHandler):
             yield m
         ip_address = self.retvalue[0]['ip_address']
         subnet_cidr = self.retvalue[0]['subnet']['cidr']
+        mtu = self.retvalue[0]['network'].get('mtu', self._parent.mtu)
         _, _, prefix = subnet_cidr.partition('/')
         port_created = False
         try:
             for m in self._parent.taskpool.runTask(self, lambda: _create_veth(self._parent.ipcommand,
                                                                              self._parent.vethprefix,
-                                                                             mac_address)):
+                                                                             mac_address,
+                                                                             mtu)):
                 yield m
             port_created = True
             device_name, _ = self.retvalue
@@ -321,6 +348,7 @@ class DockerPlugin(Module):
     _default_ovscommand = 'ovs-vsctl'
     _default_dstprefix = 'eth'
     _default_mactemplate = '02:00:00:00:00:00'
+    _default_mtu = 1500
     def __init__(self, server):
         Module.__init__(self, server)
         taskpool = TaskPool(self.scheduler)

@@ -151,6 +151,8 @@ docker network create -d vlcp --subnet 192.168.1.0/24 --ip-range 192.168.1.64/28
   + -o specify the ID of physical network you created earlier. Also, use additional -o to provide other options:
     + -o vlan=*vlantag*: For VLAN-tagged network, specify the network VLAN tag
     + -o vni=*vni*: For VXLAN overlay network, specify the VNI.
+    + -o mtu=*mtu*: Specify network MTU. For VXLAN network, better set MTU to MTU of outer network - 50, i.e. if the
+                    outer network MTU = 1500, you should specify -o mtu=1450 for VXLAN network.
   + 'vlcp_network': the docker network name, replace this to any name you preferred.
 
 ### Create container connecting to VLCP networks in docker

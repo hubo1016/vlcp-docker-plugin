@@ -11,7 +11,7 @@ except:
     pass
 from setuptools import setup, find_packages
 
-VERSION = '0.0.2'
+VERSION = '0.1.0'
 
 setup(name='vlcp-docker-plugin',
       version=VERSION,
