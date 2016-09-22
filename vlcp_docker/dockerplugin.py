@@ -142,7 +142,12 @@ class NetworkPlugin(HttpHandler):
             for k,v in params['Options']['com.docker.network.generic'].items():
                 if k.startswith('subnet:'):
                     subnet_key = k[len('subnet:'):]
-                    if v[:1] == '`' and v[-1:] == '`':
+                    if subnet_key == 'disablegateway':
+                        try:
+                            del subnet_params['gateway']
+                        except KeyError:
+                            pass
+                    elif v[:1] == '`' and v[-1:] == '`':
                         try:
                             subnet_params[subnet_key] = ast.literal_eval(v[1:-1])
                         except Exception:
