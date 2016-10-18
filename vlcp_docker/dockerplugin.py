@@ -84,7 +84,7 @@ def _create_veth(ip_command, prefix, mac_address, mtu):
     else:
         raise last_exc
     ip_output = subprocess.check_output([ip_command, "link", "show", "dev", device_name])
-    m = re.search("link/ether ([0-9a-zA-Z:]+)", ip_output)
+    m = re.search(b"link/ether ([0-9a-zA-Z:]+)", ip_output)
     if not m:
         raise ValueError('Cannot create interface')
     mac_address = m.group(1)
