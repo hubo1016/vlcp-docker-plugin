@@ -375,6 +375,7 @@ class DockerPlugin(Module):
         with watch_context(keys,retobjs,reqid,self.apiroutine):
             self.apiroutine.retvalue = [dump(v) for v in retobjs]
     def getdockerinfo(self, portid):
+        "Get docker info for specified port"
         if not isinstance(portid, str) and hasattr(portid, '__iter__'):
             for m in self._dumpkeys([DockerInfo.default_key(p) for p in portid]):
                 yield m
