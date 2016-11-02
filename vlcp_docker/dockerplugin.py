@@ -306,6 +306,7 @@ class NetworkPlugin(HttpHandler):
                         else:
                             r_g['RouteType'] = 0
                             r_g['NextHop'] = r[1]
+                        return r_g
                     result['StaticRoutes'] = [generate_route(r)
                                               for r in subnet['host_routes']]
                 except Exception:
