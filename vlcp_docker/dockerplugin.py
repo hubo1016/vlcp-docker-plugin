@@ -207,8 +207,34 @@ class NetworkPlugin(HttpHandler):
                 mac_num ^= randint(0, 0xffffffff)
             mac_address = mac_addr_bytes.formatter(create_binary(mac_num, 6))
             logport_params['mac_address'] = mac_address
-        for m in callAPI(self, 'viperflow', 'createlogicalport', logport_params):
-            yield m
+        try:
+            for m in callAPI(self, 'viperflow', 'createlogicalport', logport_params):
+                yield m
+        except Exception as exc:
+            # There is an issue that docker daemon may not delete an endpoint correctly
+            # If autoremoveports is enabled, we remove the logical port automatically
+            # Note that created veth and Openvswitch ports are not cleared because they
+            # may not on this server, so you must clean them yourself with vlcp_docker.cleanup
+            if self._parent.autoremoveports:
+                for m in callAPI(self, 'viperflow', 'listlogicalports', {'logicalnetwork': lognet_id,
+                                                                         'ip_address': ip}):
+                    yield m
+                if self.retvalue:
+                    if self.retvalue[0]['id'].startswith('docker-'):
+                        dup_pid = self.retvalue[0]['id']
+                        self._logger.warning('Duplicated ports detected: %s (%s). Will remove it.',
+                                                    dup_pid,
+                                                    self.retvalue[0]['ip_address'])
+                        for m in callAPI(self, 'viperflow', 'deletelogicalport', {'id': dup_pid}):
+                            yield m
+                        # Retry create logical port
+                        for m in callAPI(self, 'viperflow', 'createlogicalport', logport_params):
+                            yield m                        
+                    else:
+                        self._logger.warning('Duplicated with a non-docker port')
+                        raise exc
+            else:
+                raise exc
         ip_address = self.retvalue[0]['ip_address']
         subnet_cidr = self.retvalue[0]['subnet']['cidr']
         mtu = self.retvalue[0]['network'].get('mtu', self._parent.mtu)
@@ -270,8 +296,14 @@ class NetworkPlugin(HttpHandler):
                          bridge_name = self._parent.ovsbridge,
                          device_name = docker_port,
                          ip_command = self._parent.ipcommand):
-            _unplug_ovs(ovs_command, bridge_name, device_name)
-            _delete_veth(ip_command, device_name)
+            try:
+                _unplug_ovs(ovs_command, bridge_name, device_name)
+            except Exception:
+                self._logger.warning('Remove veth from OpenvSwitch failed', exc_info = True)
+            try:
+                _delete_veth(ip_command, device_name)
+            except Exception:
+                self._logger.warning('Delete veth failed', exc_info = True)
         for m in self._parent.taskpool.runTask(self, _unplug_port):
             yield m
         for m in callAPI(self, 'viperflow', 'deletelogicalport', {'id': logport_id}):
@@ -355,6 +387,8 @@ class DockerPlugin(Module):
     _default_dstprefix = 'eth'
     _default_mactemplate = '02:00:00:00:00:00'
     _default_mtu = 1500
+    _default_disabledefaultipam = False
+    _default_autoremoveports = True
     def __init__(self, server):
         Module.__init__(self, server)
         taskpool = TaskPool(self.scheduler)
