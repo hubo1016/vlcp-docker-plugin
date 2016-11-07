@@ -61,10 +61,10 @@ class Cleanup(ScriptModule):
     --nodockerinfo:     do not detect docker info, always delete logical ports
     
     '''
-    options = (('--skipovs', None, False),
-               ('--skipiplink', None, False),
-               ('--skiplogicalport', None, False),
-               ('--host', 'H', )
+    options = (('skipovs', None, False),
+               ('skipiplink', None, False),
+               ('skiplogicalport', None, False),
+               ('host', 'H', True)
                )
     def run(self, host = None, skipovs = None, skipiplink = None, skiplogicalport = None):
         skipovs = (skipovs is not None)
@@ -184,7 +184,7 @@ class Cleanup(ScriptModule):
             for m in execute_bash(find_invalid_ovs):
                 yield m
             first_invalid_ovs_list = self.apiroutine.retvalue.splitlines(False)
-            first_invalid_ovs_list = [k.trim() for k in first_invalid_ovs_list if k.trim()]
+            first_invalid_ovs_list = [k.strip() for k in first_invalid_ovs_list if k.strip()]
             if first_invalid_ovs_list:
                 print("Detect %d invalid ports from OpenvSwitch, wait 5 seconds to detect again..." % (len(first_invalid_ovs_list),))
             else:
@@ -195,7 +195,7 @@ class Cleanup(ScriptModule):
             for m in execute_bash(find_invalid_ovs):
                 yield m
             second_invalid_ovs_list = self.apiroutine.retvalue.splitlines(False)
-            second_invalid_ovs_list = [k.trim() for k in second_invalid_ovs_list if k.trim()]
+            second_invalid_ovs_list = [k.strip() for k in second_invalid_ovs_list if k.strip()]
             invalid_ports = list(set(first_invalid_ovs_list).intersection(second_invalid_ovs_list))
             if invalid_ports:
                 print('Detect %d invalid ports from intersection of two tries, removing...' % (len(invalid_ports),))
@@ -215,7 +215,7 @@ class Cleanup(ScriptModule):
             for m in execute_bash(find_unused_veth):
                 yield m
             first_unused_ports = self.apiroutine.retvalue.splitlines(False)
-            first_unused_ports = [k.trim() for k in first_unused_ports if k.trim()]
+            first_unused_ports = [k.strip() for k in first_unused_ports if k.strip()]
             if first_unused_ports:
                 print("Detect %d unused ports from ip-link, wait 5 seconds to detect again..." % (len(first_unused_ports),))
             else:
@@ -226,7 +226,7 @@ class Cleanup(ScriptModule):
             for m in execute_bash(find_unused_veth):
                 yield m
             second_unused_ports = self.apiroutine.retvalue.splitlines(False)
-            second_unused_ports = [k.trim() for k in second_unused_ports if k.trim()]
+            second_unused_ports = [k.strip() for k in second_unused_ports if k.strip()]
             unused_ports = list(set(first_unused_ports).intersection(second_unused_ports))
             if unused_ports:
                 print('Detect %d unused ports from intersection of two tries, removing...' % (len(unused_ports),))
@@ -249,11 +249,12 @@ class Cleanup(ScriptModule):
         def detect_unused_logports():
             # docker network ls
             print("Check logical ports from docker API...")
-            for m in call_docker_api(br'/networks?filters={"driver":"vlcp"}'):
+            for m in call_docker_api(br'/networks?filters={"driver":["vlcp"]}'):
                 yield m
             network_ports = dict((n['Id'], dict((p['EndpointID'], p['IPv4Address'])
                                                for p in n['Containers'].values()))
-                            for n in self.apiroutine.retvalue)
+                            for n in self.apiroutine.retvalue
+                            if n['Driver'] == 'vlcp')  # Old version of docker API does not support filter by driver
             print("Find %d networks and %d endpoints from docker API, recheck in 5 seconds..." % \
                     (len(network_ports), sum(len(ports) for ports in network_ports.values())))
             def recheck_ports():
@@ -305,10 +306,10 @@ class Cleanup(ScriptModule):
                                                  check_viperflow()]):
                 yield m
             ((second_ports,), (second_vp_ports,)) = self.apiroutine.retvalue
-            unused_logports = dict(nid, dict((pid, addr)
+            unused_logports = dict((nid, dict((pid, addr)
                                           for pid, addr in v.items()
                                           if pid not in network_ports[nid] and\
-                                             pid not in second_ports[nid])
+                                             pid not in second_ports[nid]))
                                 for nid, v in second_vp_ports.items())
             self.apiroutine.retvalue = unused_logports
         
@@ -324,23 +325,27 @@ class Cleanup(ScriptModule):
         if skiplogicalport:
             return
         (unused_logports,) = self.apiroutine.retvalue[-1]
-        print("Find %d unused logical ports, first 20 ips:\n%r" % \
-              (sum(len(ports)) for ports in unused_logports.values(),
-               [v for _,v in \
-                    itertools.takewhile(lambda x: x[0] <= 20,
-                        enumerate(itertools.chain.from_iterable(
-                            p for ports in unused_logports.values()
-                            for p in ports)))]))
-        print("Will remove them in 5 seconds, press Ctrl+C to cancel...")
-        for m in self.apiroutine.waitWithTimeout(5):
-            yield m
-        for ports in unused_logports.values():
-            for p, addr in ports.items():
-                try:
-                    for m in callAPI(self.apiroutine, 'viperflow', 'deletelogicalport',
-                                     {'id': 'docker-' + p}):
-                        yield m
-                except Exception as exc:
-                    print("WARNING: remove logical port %r (IP: %s) failed, maybe it is already removed. Message: %s" % \
-                            (p, addr, exc))
+        if any(ports for ports in unused_logports.values()):
+            print("Find %d unused logical ports, first 20 ips:\n%r" % \
+                  (sum(len(ports) for ports in unused_logports.values()),
+                   [v for _,v in \
+                        itertools.takewhile(lambda x: x[0] <= 20,
+                            enumerate(addr for ports in unused_logports.values()
+                                for addr in ports.values()))]))
+            print("Will remove them in 5 seconds, press Ctrl+C to cancel...")
+            for m in self.apiroutine.waitWithTimeout(5):
+                yield m
+            for ports in unused_logports.values():
+                for p, addr in ports.items():
+                    try:
+                        for m in callAPI(self.apiroutine, 'viperflow', 'deletelogicalport',
+                                         {'id': 'docker-' + p}):
+                            yield m
+                    except Exception as exc:
+                        print("WARNING: remove logical port %r (IP: %s) failed, maybe it is already removed. Message: %s" % \
+                                (p, addr, exc))
         print("Done.")
+
+if __name__ == '__main__':
+    Cleanup.main()
+
