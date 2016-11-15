@@ -20,11 +20,14 @@ import vlcp.service.kvdb.objectdb as objectdb
 from vlcp.event.runnable import RoutineContainer
 from namedstruct.stdprim import create_binary, uint64
 from vlcp.utils.ethernet import mac_addr_bytes
-from random import randint
+from random import randint, expovariate
 from vlcp.utils.networkmodel import LogicalPort, SubNet, SubNetMap
-from vlcp.utils.netutils import parse_ip4_network, network_first, network_last
+from vlcp.utils.netutils import parse_ip4_network, network_first, network_last,\
+    ip_in_network
 from uuid import uuid1
 import ast
+from random import random
+from vlcp.event.lock import Lock
 
 class DockerInfo(DataObject):
     _prefix = 'viperflow.dockerplugin.portinfo'
@@ -44,7 +47,7 @@ SubNet._register_auto_remove('IPAMReserve', lambda x: [IPAMReserve.default_key(x
                                                         if hasattr(x, 'docker_ipam_poolid') else [])
 
 class IPAMPoolReserve(DataObject):
-    _prefix = 'viperrflow.dockerplugin.ipampool'
+    _prefix = 'viperflow.dockerplugin.ipampool'
     def __init__(self, prefix=None, deleted=False):
         DataObject.__init__(self, prefix=prefix, deleted=deleted)
         # Should be dictionary of {PoolId: [CIDR, timeout]}
@@ -153,8 +156,8 @@ class NetworkPlugin(HttpHandler):
         self.cidrrange_subnet = subnet
         self.cidrrange_mask = mask
         self.cidrrange_end = (1 << (24 - mask))
-        self.pooltimeout = self.parent.pooltimeout
-        self.iptimeout = self.parent.iptimeout
+        self.pooltimeout = parent.pooltimeout
+        self.iptimeout = parent.iptimeout
         self._reqid = 0
         
     @HttpHandler.route(br'/Plugin\.Activate', method = [b'POST'])
@@ -186,71 +189,97 @@ class NetworkPlugin(HttpHandler):
             raise ValueError('Unsupported address space: must use this IPAM driver together with network driver')
         if params['V6']:
             raise ValueError('IPv6 is not supported')
-        new_pool = IPAMReserve.create_instance(id = uuid1(),
-                                               pool = params['Pool'],
-                                               subpool = params['SubPool'],
-                                               options = params['Options']
-                                               )
-        while True:
-            rets = []
-            def _updater(keys, values, timestamp):
-                reservepool = values[0]
-                reserve_new_pool = set_new(values[1], new_pool)
-                remove_keys = self._remove_staled_pools(reservepool, timestamp)
-                used_cidrs = set(cidr for _, (cidr, _) in reservepool.reserved_pools.items())
-                if not reserve_new_pool.pool:
-                    # pool is not specified
-                    for _ in range(0, self.cidrrange_end):
-                        reservepool.nextalloc += 1
-                        if reservepool.nextalloc >= self.cidrrange_end:
-                            reservepool.nextalloc = 0
-                        new_subnet = self.cidrrange_subnet | (reservepool.nextalloc << 8)
-                        new_cidr = ip4_addr.formatter(new_subnet) + '/24'
-                        if new_cidr not in used_cidrs:
-                            break
-                    reserve_new_pool.pool = new_cidr
-                    reserve_new_pool.subpool = ''
-                rets[:] = [reserve_new_pool.pool]
-                if reserve_new_pool.pool in used_cidrs:
-                    # We must wait until this CIDR is released
-                    raise IPAMUsingException
-                reservepool.reserved_pools[reserve_new_pool.id] = \
-                                                   [reserve_new_pool.pool,
-                                                   timestamp + self.pooltimeout * 1000000]
-                marker = IPAMReserveMarker.create_instance(cidr = reserve_new_pool.pool)
-                if marker.getkey() in remove_keys:
-                    remove_keys.remove(marker.getkey())
-                    return (tuple(keys[0:1]) + tuple(remove_keys),
-                        (reservepool, reserve_new_pool) + (None,) * len(remove_keys))
+        new_pool = IPAMReserve.create_instance(uuid1().hex)
+        new_pool.pool = params['Pool']
+        if new_pool.pool:
+            subnet, mask = parse_ip4_network(new_pool.pool)
+            new_pool.pool = ip4_addr.formatter(subnet) + '/' + str(mask)
+        new_pool.subpool = params['SubPool']
+        if new_pool.subpool:
+            subnet, mask = parse_ip4_network(new_pool.subpool)
+            new_pool.subpool = ip4_addr.formatter(subnet) + '/' + str(mask)
+        new_pool.options = params['Options']
+        if new_pool.pool:
+            l = Lock(('dockerplugin_ipam_request_pool', new_pool.pool), self.scheduler)
+            for m in l.lock(self):
+                yield m
+        else:
+            l = None
+        try:
+            while True:
+                fail = 0
+                rets = []
+                def _updater(keys, values, timestamp):
+                    reservepool = values[0]
+                    reserve_new_pool = set_new(values[1], new_pool)
+                    remove_keys = self._remove_staled_pools(reservepool, timestamp)
+                    used_cidrs = set(cidr for _, (cidr, _) in reservepool.reserved_pools.items())
+                    if not reserve_new_pool.pool:
+                        # pool is not specified
+                        for _ in range(0, self.cidrrange_end):
+                            reservepool.nextalloc += 1
+                            if reservepool.nextalloc >= self.cidrrange_end:
+                                reservepool.nextalloc = 0
+                            new_subnet = self.cidrrange_subnet | (reservepool.nextalloc << 8)
+                            new_cidr = ip4_addr.formatter(new_subnet) + '/24'
+                            if new_cidr not in used_cidrs:
+                                break
+                        reserve_new_pool.pool = new_cidr
+                        reserve_new_pool.subpool = ''
+                    rets[:] = [reserve_new_pool.pool]
+                    if reserve_new_pool.pool in used_cidrs:
+                        # We must wait until this CIDR is released
+                        raise IPAMUsingException
+                    reservepool.reserved_pools[reserve_new_pool.id] = \
+                                                       [reserve_new_pool.pool,
+                                                       timestamp + self.pooltimeout * 1000000]
+                    marker = IPAMReserveMarker.create_instance(reserve_new_pool.pool)
+                    if marker.getkey() in remove_keys:
+                        remove_keys.remove(marker.getkey())
+                        return (tuple(keys[0:2]) + tuple(remove_keys),
+                            (reservepool, reserve_new_pool) + (None,) * len(remove_keys))
+                    else:
+                        return (tuple(keys[0:2]) + (marker.getkey(),) + tuple(remove_keys),
+                            (reservepool, reserve_new_pool, marker) + (None,) * len(remove_keys))
+                try:
+                    for m in callAPI(self, 'objectdb', 'transact', {'keys': (IPAMPoolReserve.default_key(),
+                                                                             new_pool.getkey()),
+                                                                    'updater': _updater,
+                                                                    'withtime': True}):
+                        yield m
+                except IPAMUsingException:
+                    # Wait for the CIDR to be released
+                    self._reqid += 1
+                    fail += 1
+                    reqid = ('dockerplugin_ipam', self._reqid)
+                    marker_key = IPAMReserveMarker.default_key(rets[0])
+                    for m in callAPI(self, 'objectdb', 'get', {'key': marker_key,
+                                                               'requestid': reqid,
+                                                               'nostale': True}):
+                        yield m
+                    retvalue = self.retvalue
+                    with watch_context([marker_key], [retvalue], reqid, self):
+                        while retvalue is not None and not retvalue.isdeleted():
+                            for m in retvalue.waitif(self, lambda x: x.isdeleted()):
+                                yield m
+                            if fail >= 2:
+                                # If we fail many times, insert random wait to reduce collision
+                                waittime = min(expovariate(10.0), 1.0)
+                                for m in self.executeWithTimeout(waittime, retvalue.wait()):
+                                    yield m
+                                if self.timeout:
+                                    break
+                            else:
+                                break
                 else:
-                    return (tuple(keys[0:1]) + (marker.getkey(),) + tuple(remove_keys),
-                        (reservepool, reserve_new_pool, marker) + (None,) * len(remove_keys))
-            try:
-                for m in callAPI(self, 'objectdb', 'transact', {'keys': (IPAMPoolReserve.default_key(),
-                                                                         new_pool.getkey()),
-                                                                'updater': _updater,
-                                                                'withtime': True}):
-                    yield m
-            except IPAMUsingException:
-                # Wait for the CIDR to be released
-                self._reqid += 1
-                reqid = ('dockerplugin_ipam', self._reqid)
-                marker_key = IPAMReserveMarker.default_key(rets[0])
-                for m in callAPI(self, 'objectdb', 'get', {'key': marker_key,
-                                                           'requestid': reqid,
-                                                           'nostale': True}):
-                    yield m
-                retvalue = self.retvalue
-                with watch_context([marker_key], [retvalue], reqid, self):
-                    if retvalue is not None and not retvalue.isdeleted():
-                        for m in retvalue.waitif(self, lambda x: x.isdeleted()):
-                            yield m
-            else:
-                env.outputjson({'PoolID': new_pool.id,
-                                'Pool': rets[0],
-                                'Data': {}})
-                break
-    
+                    env.outputjson({'PoolID': new_pool.id,
+                                    'Pool': rets[0],
+                                    'Data': {}})
+                    break
+        finally:
+            if l is not None:
+                l.unlock()
+            
     @_routeapi(br'/IpamDriver\.ReleasePool')
     def ipam_releasepool(self, env, params):
         poolid = params['PoolID']
@@ -274,13 +303,14 @@ class NetworkPlugin(HttpHandler):
     
     def _remove_staled_ips(self, pool, timestamp):
         pool.reserved_ips = dict((addr, ts) for addr,ts in pool.reserved_ips.items()
-                                 if ts >= timestamp)
+                                 if ts is None or ts >= timestamp)
     
     @_routeapi(br'/IpamDriver\.RequestAddress')
     def ipam_requestaddress(self, env, params):
         poolid = params['PoolID']
         address = params['Address']
-        address = ip4_addr.formatter(ip4_addr(address))
+        if address:
+            address = ip4_addr.formatter(ip4_addr(address))
         reserve_key = IPAMReserve.default_key(poolid)
         rets = []
         def _updater(keys, values, timestamp):
@@ -292,6 +322,7 @@ class NetworkPlugin(HttpHandler):
                 subnetmap = values[1]
                 if not hasattr(pool, 'subnetmap') or pool.subnetmap.getkey() != keys[1]:
                     raise RetryUpdateException
+                subnet = values[2]
             else:
                 subnetmap = None
                 if hasattr(pool, 'subnetmap'):
@@ -300,14 +331,21 @@ class NetworkPlugin(HttpHandler):
                 # check ip_address in cidr
                 if address in pool.reserved_ips:
                     raise ValueError("IP address " + address + " has been reserved")
+                if pool.subpool:
+                    cidr = pool.subpool
+                else:
+                    cidr = pool.pool
+                network, mask = parse_ip4_network(cidr)
+                addr_num = ip4_addr(address)
+                if not ip_in_network(addr_num, network, mask):
+                    raise ValueError('IP address ' + address + " is not in the network CIDR")
                 if subnetmap is not None:
-                    addr_num = ip4_addr(address)
-                    start = ip4_addr(subnetmap.allocated_start)
-                    end = ip4_addr(subnetmap.allocated_end)
+                    start = ip4_addr(subnet.allocated_start)
+                    end = ip4_addr(subnet.allocated_end)
                     try:
                         assert start <= addr_num <= end
-                        if hasattr(subnetmap, 'gateway'):
-                            assert addr_num != ip4_addr(subnetmap.gateway)
+                        if hasattr(subnet, 'gateway'):
+                            assert addr_num != ip4_addr(subnet.gateway)
                     except Exception:
                         raise ValueError("specified IP address " + address + " is not valid")
     
@@ -317,18 +355,17 @@ class NetworkPlugin(HttpHandler):
             else:
                 # allocated ip_address from cidr
                 gateway = None
+                cidr = pool.pool
+                if pool.subpool:
+                    cidr = pool.subpool
+                network, prefix = parse_ip4_network(cidr)
+                start = network_first(network, prefix)
+                end = network_last(network, prefix)
                 if subnetmap is not None:
-                    start = ip4_addr(subnetmap.allocated_start)
-                    end = ip4_addr(subnetmap.allocated_end)
-                    if hasattr(subnetmap, "gateway"):
-                        gateway = ip4_addr(subnetmap.gateway)
-                else:
-                    cidr = pool.pool
-                    if pool.subpool:
-                        cidr = pool.subpool
-                    network, prefix = parse_ip4_network(cidr)
-                    start = network_first(network, prefix)
-                    end = network_last(network, prefix)
+                    start = max(start, ip4_addr(subnet.allocated_start))
+                    end = min(end, ip4_addr(subnet.allocated_end))
+                    if hasattr(subnet, "gateway"):
+                        gateway = ip4_addr(subnet.gateway)
                 for ip_address in range(start,end):
                     new_address = ip4_addr.formatter(ip_address)
                     if ip_address != gateway and \
@@ -356,7 +393,7 @@ class NetworkPlugin(HttpHandler):
                     raise ValueError('PoolID %r does not exist' % (poolid,))
                 if hasattr(reserve_pool, 'subnetmap'):
                     # Retrieve both the reserve pool and the subnet map
-                    keys = (reserve_key, reserve_pool.subnetmap.getkey())
+                    keys = (reserve_key, reserve_pool.subnetmap.getkey(), SubNet.default_key(reserve_pool.subnetmap.id))
                 else:
                     keys = (reserve_key,)
                 try:
@@ -378,12 +415,12 @@ class NetworkPlugin(HttpHandler):
         def _updater(keys, values, timestamp):
             pool = values[0]
             if pool is None:
-                raise ValueError('PoolID %r does not exist' % (poolid,))
+                return ((), ())
             self._remove_staled_ips(pool, timestamp)
             if address in pool.reserved_ips:
                 del pool.reserved_ips[address]
             return ((keys[0],), (pool,))
-        for m in callAPI(self, 'objectdb', 'transact', {'keys': (),
+        for m in callAPI(self, 'objectdb', 'transact', {'keys': (IPAMReserve.default_key(poolid),),
                                                         'updater': _updater,
                                                         'withtime': True}):
             yield m
@@ -397,7 +434,7 @@ class NetworkPlugin(HttpHandler):
     def createnetwork(self, env, params):
         lognet_id = 'docker-' + params['NetworkID'] + '-lognet'
         network_params = {'id': lognet_id}
-        if params['IPv4Data'] and params['IPv4Data']['AddressSpace'] == _GLOBAL_SPACE:
+        if params['IPv4Data'] and params['IPv4Data'][0]['AddressSpace'] == _GLOBAL_SPACE:
             request_cidr = params['IPv4Data'][0]['Pool']
             # Using network driver together with IPAM driver
             rets = []
@@ -483,16 +520,20 @@ class NetworkPlugin(HttpHandler):
                 removed_keys = self._remove_staled_pools(reservepool, timestamp)
                 if docker_ipam_poolid not in reservepool.reserved_pools:
                     raise ValueError('Pool %r is not reserved by VLCP IPAM plugin' % (docker_ipam_poolid,))
+                removed_keys.append(IPAMReserveMarker.default_key(reservepool.reserved_pools[docker_ipam_poolid][0]))
                 del reservepool.reserved_pools[docker_ipam_poolid]
                 pool.subnetmap = subnetmap.create_reference()
                 self._remove_staled_ips(pool, timestamp)
                 if gateway is not None and gateway in pool.reserved_ips:
-                    del pool.reserved_ips[gateway]
-                return (tuple(keys[0:1]) + tuple(removed_keys), (reservepool, pool) + (None,) * len(removed_keys))
+                    # Reserve forever
+                    pool.reserved_ips[gateway] = None
+                return (tuple(keys[0:2]) + tuple(removed_keys), (reservepool, pool) + (None,) * len(removed_keys))
             try:
                 for m in callAPI(self, 'objectdb', 'transact', {'keys': (IPAMPoolReserve.default_key(),
                                                                          IPAMReserve.default_key(docker_ipam_poolid),
-                                                                         SubNetMap.default_key(subnet_id))}):
+                                                                         SubNetMap.default_key(subnet_id)),
+                                                                'updater': _ipam_stage2,
+                                                                'withtime': True}):
                     yield m
             except Exception as exc:
                 for m in callAPI(self, 'viperflow', 'deletesubnet', {'id': subnet_id}):
@@ -575,6 +616,8 @@ class NetworkPlugin(HttpHandler):
                 raise exc
         ip_address = self.retvalue[0]['ip_address']
         subnet_cidr = self.retvalue[0]['subnet']['cidr']
+        mtu = self.retvalue[0]['network'].get('mtu', self._parent.mtu)
+        _, _, prefix = subnet_cidr.partition('/')
         if 'docker_ipam_poolid' in self.retvalue[0]['subnet']:
             try:
                 # The reservation is completed, remove the temporary reservation
@@ -592,8 +635,6 @@ class NetworkPlugin(HttpHandler):
             except Exception:
                 self._logger.warning('Unexpected exception while removing reservation of IP address %r, will ignore and continue',
                                      ip_address, exc_info = True)
-        mtu = self.retvalue[0]['network'].get('mtu', self._parent.mtu)
-        _, _, prefix = subnet_cidr.partition('/')
         port_created = False
         try:
             for m in self._parent.taskpool.runTask(self, lambda: _create_veth(self._parent.ipcommand,
@@ -751,7 +792,7 @@ class DockerPlugin(Module):
     _default_mtu = 1500
     _default_disabledefaultipam = False
     _default_autoremoveports = True
-    _default_pooltimeout = 20
+    _default_pooltimeout = 60
     _default_iptimeout = 60
     _default_cidrrange = '10.0.0.0/8'
     def __init__(self, server):
