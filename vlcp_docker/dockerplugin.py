@@ -259,18 +259,9 @@ class NetworkPlugin(HttpHandler):
                         yield m
                     retvalue = self.retvalue
                     with watch_context([marker_key], [retvalue], reqid, self):
-                        while retvalue is not None and not retvalue.isdeleted():
-                            for m in retvalue.waitif(self, lambda x: x.isdeleted()):
+                        if retvalue is not None and not retvalue.isdeleted():
+                            for m in self.executeWithTimeout(self.pooltimeout, retvalue.waitif(self, lambda x: x.isdeleted())):
                                 yield m
-                            if fail >= 2:
-                                # If we fail many times, insert random wait to reduce collision
-                                waittime = min(expovariate(10.0), 1.0)
-                                for m in self.executeWithTimeout(waittime, retvalue.wait()):
-                                    yield m
-                                if self.timeout:
-                                    break
-                            else:
-                                break
                 else:
                     env.outputjson({'PoolID': new_pool.id,
                                     'Pool': rets[0],
