@@ -630,10 +630,12 @@ class NetworkPlugin(HttpHandler):
                             yield m
                         # Retry create logical port
                         for m in callAPI(self, 'viperflow', 'createlogicalport', logport_params):
-                            yield m                        
+                            yield m
                     else:
                         self._logger.warning('Duplicated with a non-docker port')
                         raise exc
+                else:
+                    raise exc
             else:
                 raise exc
         ip_address = self.retvalue[0]['ip_address']
