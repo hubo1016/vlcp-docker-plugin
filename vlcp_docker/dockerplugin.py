@@ -424,28 +424,48 @@ class NetworkPlugin(HttpHandler):
     @_routeapi(br'/NetworkDriver\.CreateNetwork')
     def createnetwork(self, env, params):
         lognet_id = 'docker-' + params['NetworkID'] + '-lognet'
+        subnet_id = 'docker-' + params['NetworkID'] + '-subnet'
         network_params = {'id': lognet_id}
+        if params['IPv4Data'] and 'Gateway' in params['IPv4Data'][0]:
+            gateway, _, _ = params['IPv4Data'][0]['Gateway'].partition('/')
+        else:
+            gateway = None
         if params['IPv4Data'] and params['IPv4Data'][0]['AddressSpace'] == _GLOBAL_SPACE:
             request_cidr = params['IPv4Data'][0]['Pool']
-            # Using network driver together with IPAM driver
-            rets = []
-            def _ipam_stage1(keys, values, timestamp):
-                reservepool = values[0]
-                removed_keys = self._remove_staled_pools(reservepool, timestamp)
-                poolids = [poolid for poolid, (cidr, _) in reservepool.reserved_pools.items()
-                           if cidr == request_cidr]
-                if not poolids:
-                    raise ValueError('Pool %r is not reserved by VLCP IPAM plugin' % (request_cidr,))
-                rets[:] = [poolids[0]]
-                reservepool.reserved_pools[poolids[0]][1] = timestamp + self.pooltimeout * 1000000
-                return ((keys[0],) + tuple(removed_keys), (reservepool,) + (None,) * len(removed_keys))
-            for m in callAPI(self, 'objectdb', 'transact', {'keys': (IPAMPoolReserve.default_key(),),
-                                                            'updater': _ipam_stage1,
-                                                            'withtime': True}):
-                yield m
-            docker_ipam_poolid = rets[0]
+            docker_ipam_poolid = True
+            def _ipam_work():
+                # Using network driver together with IPAM driver
+                rets = []
+                def _ipam_stage(keys, values, timestamp):
+                    reservepool = values[0]
+                    removed_keys = self._remove_staled_pools(reservepool, timestamp)
+                    poolids = [poolid for poolid, (cidr, _) in reservepool.reserved_pools.items()
+                               if cidr == request_cidr]
+                    if not poolids:
+                        raise ValueError('Pool %r is not reserved by VLCP IPAM plugin' % (request_cidr,))
+                    docker_ipam_poolid = poolids[0]
+                    rets[:] = [docker_ipam_poolid]
+                    removed_keys.append(IPAMReserveMarker.default_key(reservepool.reserved_pools[docker_ipam_poolid][0]))
+                    del reservepool.reserved_pools[docker_ipam_poolid]
+                    return ((keys[0],) + tuple(removed_keys), (reservepool,) + (None,) * len(removed_keys))
+                try:
+                    for m in callAPI(self, 'objectdb', 'transact', {'keys': (IPAMPoolReserve.default_key(),),
+                                                                    'updater': _ipam_stage,
+                                                                    'withtime': True}):
+                        yield m
+                    self.retvalue = (True, rets[0])
+                except Exception as exc:
+                    self.retvalue = (False, exc)
+                    
         else:
             docker_ipam_poolid = None
+        def _cleanup_ipam(docker_ipam_poolid):
+            @updater
+            def _remove_reserve(pool):
+                return (None,)
+            for m in callAPI(self, 'objectdb', 'transact', {'keys': (IPAMReserve.default_key(docker_ipam_poolid),),
+                                                            'updater': _remove_reserve}):
+                yield m
         if 'Options' in params and 'com.docker.network.generic' in params['Options']:
             for k,v in params['Options']['com.docker.network.generic'].items():
                 if k.startswith('subnet:'):
@@ -459,17 +479,53 @@ class NetworkPlugin(HttpHandler):
                         network_params[k] = v
                 else:
                     network_params[k] = v
-        for m in callAPI(self, 'viperflow', 'createlogicalnetwork', network_params):
-            yield m
-        subnet_id = 'docker-' + params['NetworkID'] + '-subnet'
+        def _create_lognet():
+            try:
+                for m in callAPI(self, 'viperflow', 'createlogicalnetwork', network_params):
+                    yield m
+            except Exception as exc:
+                self.retvalue = exc
+            else:
+                self.retvalue = None
+        if docker_ipam_poolid:
+            for m in self.executeAll([_ipam_work(),
+                                      _create_lognet()], self):
+                yield m
+            (((ipam_succ, ipam_result),), (create_lognet_exc,)) = self.retvalue
+            if not ipam_succ:
+                if create_lognet_exc is None:
+                    try:
+                        for m in callAPI(self, 'viperflow', 'deletelogicalnetwork', {'id': lognet_id}):
+                            yield m
+                    except Exception:
+                        pass
+                raise ipam_result
+            elif create_lognet_exc is not None:
+                self.subroutine(_cleanup_ipam(ipam_result))
+                raise create_lognet_exc
+            else:
+                docker_ipam_poolid = ipam_result
+            def _ipam_work2():
+                def _ipam_stage2(keys, values, timestamp):
+                    pool = values[0]
+                    pool.subnetmap = ReferenceObject(SubNetMap.default_key(subnet_id))
+                    self._remove_staled_ips(pool, timestamp)
+                    if gateway is not None and gateway in pool.reserved_ips:
+                        # Reserve forever
+                        pool.reserved_ips[gateway] = None
+                    return ((keys[0],), (pool,))
+                for m in callAPI(self, 'objectdb', 'transact', {'keys': (IPAMReserve.default_key(docker_ipam_poolid),),
+                                                                'updater': _ipam_stage2,
+                                                                'withtime': True}):
+                    yield m
+        else:
+            for m in _create_lognet():
+                yield m
         subnet_params = {'logicalnetwork': lognet_id,
                         'cidr': params['IPv4Data'][0]['Pool'],
                         'id': subnet_id}
-        if params['IPv4Data'] and 'Gateway' in params['IPv4Data'][0]:
-            gateway, _, _ = params['IPv4Data'][0]['Gateway'].partition('/')
+        if gateway is not None:
             subnet_params['gateway'] = gateway
-        else:
-            gateway = None
         if 'Options' in params and 'com.docker.network.generic' in params['Options']:
             for k,v in params['Options']['com.docker.network.generic'].items():
                 if k.startswith('subnet:'):
@@ -488,50 +544,25 @@ class NetworkPlugin(HttpHandler):
                         subnet_params[subnet_key] = v
         if docker_ipam_poolid is not None:
             subnet_params['docker_ipam_poolid'] = docker_ipam_poolid
-        try:
+        def _create_subnet():
             for m in callAPI(self, 'viperflow', 'createsubnet', subnet_params):
                 yield m
+        if docker_ipam_poolid:
+            routines = [_ipam_work2(), _create_subnet()]
+        else:
+            routines = [_create_subnet()]
+        try:
+            for m in self.executeAll(routines):
+                yield m
         except Exception as exc:
+            if docker_ipam_poolid is not None:
+                self.subroutine(_cleanup_ipam(docker_ipam_poolid))
             try:
                 for m in callAPI(self, 'viperflow', 'deletelogicalnetwork', {'id': lognet_id}):
                     yield m
             except Exception:
                 pass
-            raise exc
-        if docker_ipam_poolid is not None:
-            # Link the pool to created subnet
-            def _ipam_stage2(keys, values, timestamp):
-                reservepool = values[0]
-                pool = values[1]
-                subnetmap = values[2]
-                if pool is None:
-                    raise ValueError('Pool %r is not reserved by VLCP IPAM plugin' % (docker_ipam_poolid,))
-                if subnetmap is None:
-                    raise ValueError('Unexpected exception: subnet is not found')
-                removed_keys = self._remove_staled_pools(reservepool, timestamp)
-                if docker_ipam_poolid not in reservepool.reserved_pools:
-                    raise ValueError('Pool %r is not reserved by VLCP IPAM plugin' % (docker_ipam_poolid,))
-                removed_keys.append(IPAMReserveMarker.default_key(reservepool.reserved_pools[docker_ipam_poolid][0]))
-                del reservepool.reserved_pools[docker_ipam_poolid]
-                pool.subnetmap = subnetmap.create_reference()
-                self._remove_staled_ips(pool, timestamp)
-                if gateway is not None and gateway in pool.reserved_ips:
-                    # Reserve forever
-                    pool.reserved_ips[gateway] = None
-                return (tuple(keys[0:2]) + tuple(removed_keys), (reservepool, pool) + (None,) * len(removed_keys))
-            try:
-                for m in callAPI(self, 'objectdb', 'transact', {'keys': (IPAMPoolReserve.default_key(),
-                                                                         IPAMReserve.default_key(docker_ipam_poolid),
-                                                                         SubNetMap.default_key(subnet_id)),
-                                                                'updater': _ipam_stage2,
-                                                                'withtime': True}):
-                    yield m
-            except Exception as exc:
-                for m in callAPI(self, 'viperflow', 'deletesubnet', {'id': subnet_id}):
-                    yield m
-                for m in callAPI(self, 'viperflow', 'deletelogicalnetwork', {'id': lognet_id}):
-                    yield m
-                raise exc
+            raise exc        
         env.outputjson({})
         
     @_routeapi(br'/NetworkDriver\.DeleteNetwork')
@@ -610,22 +641,25 @@ class NetworkPlugin(HttpHandler):
         mtu = self.retvalue[0]['network'].get('mtu', self._parent.mtu)
         _, _, prefix = subnet_cidr.partition('/')
         if 'docker_ipam_poolid' in self.retvalue[0]['subnet']:
-            try:
-                # The reservation is completed, remove the temporary reservation
-                def _ipam_updater(keys, values, timestamp):
-                    pool = values[0]
-                    self._remove_staled_ips(pool, timestamp)
-                    if ip_address in pool.reserved_ips:
-                        del pool.reserved_ips[ip_address]
-                    return ((keys[0],), (pool,))
-                for m in callAPI(self, 'objectdb', 'transact',
-                                 {'keys': (IPAMReserve.default_key(self.retvalue[0]['subnet']['docker_ipam_poolid']),),
-                                  'updater': _ipam_updater,
-                                  'withtime': True}):
-                    yield m
-            except Exception:
-                self._logger.warning('Unexpected exception while removing reservation of IP address %r, will ignore and continue',
+            docker_ipam_poolid = self.retvalue[0]['subnet']['docker_ipam_poolid']
+            def _remove_ip_reservation():
+                try:
+                    # The reservation is completed, remove the temporary reservation
+                    def _ipam_updater(keys, values, timestamp):
+                        pool = values[0]
+                        self._remove_staled_ips(pool, timestamp)
+                        if ip_address in pool.reserved_ips:
+                            del pool.reserved_ips[ip_address]
+                        return ((keys[0],), (pool,))
+                    for m in callAPI(self, 'objectdb', 'transact',
+                                     {'keys': (IPAMReserve.default_key(docker_ipam_poolid),),
+                                      'updater': _ipam_updater,
+                                      'withtime': True}):
+                        yield m
+                except Exception:
+                    self._logger.warning('Unexpected exception while removing reservation of IP address %r, will ignore and continue',
                                      ip_address, exc_info = True)
+            self.subroutine(_remove_ip_reservation())
         port_created = False
         try:
             for m in self._parent.taskpool.runTask(self, lambda: _create_veth(self._parent.ipcommand,
