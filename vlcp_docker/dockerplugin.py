@@ -809,18 +809,36 @@ class NetworkPlugin(HttpHandler):
 @defaultconfig
 @depend(httpserver.HttpServer, viperflow.ViperFlow, objectdb.ObjectDB)
 class DockerPlugin(Module):
+    '''
+    Integrate VLCP with Docker
+    '''
+    # Bind Docker API EndPoint (a HTTP service) to specified vHost
     _default_vhostbind = 'docker'
+    # OpenvSwitch bridge used in this server
     _default_ovsbridge = 'dockerbr0'
+    # Auto-created veth device prefix
     _default_vethprefix = 'vlcp'
+    # Path to ``ip`` command
     _default_ipcommand = 'ip'
+    # Path to ``ovs-vsctl`` command
     _default_ovscommand = 'ovs-vsctl'
+    # vNIC prefix used in the docker container
     _default_dstprefix = 'eth'
+    # A template MAC address used on generating MAC addresses
     _default_mactemplate = '02:00:00:00:00:00'
+    # Default MTU used for networks
     _default_mtu = 1500
-    _default_disabledefaultipam = False
+    # Try to remove the old port if it is not clean up correctly
     _default_autoremoveports = True
+    # IPAM pool reserve timeout. If a reserved pool is not used to
+    # create a network till timeout, it is automatically released.
     _default_pooltimeout = 60
+    # IPAM IP reserve timeout. If an IP address is not used to
+    # create an endpoint till timeout, it is automatically released.
     _default_iptimeout = 60
+    # The default address space used when subnet is not specified.
+    # A C-class (like 10.0.1.0/24) subnet will be assigned for each
+    # network.
     _default_cidrrange = '10.0.0.0/8'
     def __init__(self, server):
         Module.__init__(self, server)
