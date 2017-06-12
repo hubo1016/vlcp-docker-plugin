@@ -685,7 +685,9 @@ class NetworkPlugin(HttpHandler):
                                                                           device_name,
                                                                           logport_id)):
                 yield m
-            result = {'Interface':{'MacAddress': mac_address}}
+            result = {'Interface': {}}
+            if 'MacAddress' not in interface:
+                result['Interface']['MacAddress'] = mac_address
             if 'Address' not in interface:
                 result['Interface']['Address'] = ip_address + '/' + prefix
             env.outputjson(result)
