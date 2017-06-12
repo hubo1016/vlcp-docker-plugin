@@ -78,7 +78,7 @@ def _routeapi(path):
                     charset = 'utf-8'
                 for m in env.inputstream.read(self):
                     yield m
-                params = json.loads(_str(self.data, charset), charset)
+                params = json.loads(_str(self.data, charset), encoding=charset)
                 self._logger.debug('Call %r with parameters: %r', path, params)
                 r = func(self, env, params)
                 if r is not None:
