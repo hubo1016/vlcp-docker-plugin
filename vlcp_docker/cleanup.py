@@ -302,10 +302,12 @@ class Cleanup(ScriptModule):
                                                   for pid, addr in v.items()))
                                        for nid, v in second_vp_ports.items())
                 self.apiroutine.retvalue = second_vp_ports
-            for m in self.apiroutine.executeAll([recheck_ports(),
-                                                 check_viperflow()]):
+            for m in check_viperflow():
                 yield m
-            ((second_ports,), (second_vp_ports,)) = self.apiroutine.retvalue
+            second_vp_ports = self.apiroutine.retvalue
+            for m in recheck_ports():
+                yield m
+            second_ports = self.apiroutine.retvalue
             unused_logports = dict((nid, dict((pid, addr)
                                           for pid, addr in v.items()
                                           if pid not in network_ports[nid] and\
