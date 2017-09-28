@@ -249,7 +249,7 @@ class Cleanup(ScriptModule):
         def detect_unused_logports():
             # docker network ls
             print("Check logical ports from docker API...")
-            for m in call_docker_api(br'/networks?filters={"driver":["vlcp"]}'):
+            for m in call_docker_api(br'/v1.24/networks?filters={"driver":["vlcp"]}'):
                 yield m
             network_ports = dict((n['Id'], dict((p['EndpointID'], p['IPv4Address'])
                                                for p in n['Containers'].values()))
