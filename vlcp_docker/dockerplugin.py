@@ -715,7 +715,9 @@ class NetworkPlugin(HttpHandler):
         logport_id = 'docker-' + params['EndpointID']
         for m in callAPI(self, 'dockerplugin', 'getdockerinfo', {'portid': logport_id}):
             yield m
-        if not self.retvalue:
+        
+        # docker info will auto remove when logicalport remove , mget docker info will get None
+        if not self.retvalue or not self.retvalue[0]:
             raise KeyError(repr(params['EndpointID']) + ' not found')
         dockerinfo_result = self.retvalue[0]
         docker_port = dockerinfo_result['docker_port']
