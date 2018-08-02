@@ -316,7 +316,7 @@ class NetworkPlugin(HttpHandler):
                 if hasattr(pool, 'subnetmap'):
                     subnetmap_key = pool.subnetmap.getkey()
                     subnet_key = SubNetMap._subnet.rightkey(subnetmap_key)
-                    ensure_keys(subnet_key, subnetmap_key)
+                    ensure_keys(walk, subnet_key, subnetmap_key)
                     subnetmap = walk(subnetmap_key)
                     subnet = walk(subnet_key)
                 else:
