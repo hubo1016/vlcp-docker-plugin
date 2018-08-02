@@ -315,7 +315,7 @@ class NetworkPlugin(HttpHandler):
                 self._remove_staled_ips(pool, timestamp)
                 if hasattr(pool, 'subnetmap'):
                     subnetmap_key = pool.subnetmap.getkey()
-                    subnet_key = SubNetMap._network.rightkey(subnetmap_key)
+                    subnet_key = SubNetMap._subnet.rightkey(subnetmap_key)
                     ensure_keys(subnet_key, subnetmap_key)
                     subnetmap = walk(subnetmap_key)
                     subnet = walk(subnet_key)
