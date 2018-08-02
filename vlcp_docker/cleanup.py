@@ -39,7 +39,10 @@ _find_unused_veth = '''#/bin/bash
 '''
 
 def _bytes(s, encoding = 'ascii'):
-    return s.encode(encoding)
+    if isinstance(s, str):
+        return s.encode(encoding)
+    else:
+        return s
 
 def _str(s, encoding = 'utf-8'):
     if not isinstance(s, str):
@@ -150,7 +153,7 @@ class Cleanup(ScriptModule):
             def task():
                 try:
                     sp = subprocess.Popen(['bash'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    outdata, errdata = sp.communicate(script)
+                    outdata, errdata = sp.communicate(_bytes(script))
                     sys.stderr.write(_str(errdata))
                     errno = sp.poll()
                     if errno != 0 and not ignoreerror:
