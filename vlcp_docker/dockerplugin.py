@@ -3,7 +3,7 @@ Created on 2016/8/22
 
 :author: hubo
 '''
-from vlcp.server.module import Module, callAPI, depend, api
+from vlcp.server.module import Module, call_api, depend, api
 import vlcp.service.connection.httpserver as httpserver
 import vlcp.service.sdn.viperflow as viperflow
 from vlcp.utils.connector import TaskPool
@@ -15,19 +15,22 @@ import functools
 import re
 from vlcp.utils.ethernet import ip4_addr, mac_addr
 from vlcp.utils.dataobject import DataObject, watch_context, dump, updater,\
-    set_new, ReferenceObject
+    set_new, ReferenceObject, request_context
 import vlcp.service.kvdb.objectdb as objectdb
 from vlcp.event.runnable import RoutineContainer
 from namedstruct.stdprim import create_binary, uint64
 from vlcp.utils.ethernet import mac_addr_bytes
-from random import randint, expovariate
+from random import randint
 from vlcp.utils.networkmodel import LogicalPort, SubNet, SubNetMap
 from vlcp.utils.netutils import parse_ip4_network, network_first, network_last,\
     ip_in_network
 from uuid import uuid1
 import ast
-from random import random
 from vlcp.event.lock import Lock
+from vlcp.utils.exceptions import WalkKeyNotRetrieved
+from contextlib import suppress
+from vlcp.utils.walkerlib import ensure_keys
+import asyncio.subprocess
 
 class DockerInfo(DataObject):
     _prefix = 'viperflow.dockerplugin.portinfo'
@@ -54,9 +57,11 @@ class IPAMPoolReserve(DataObject):
         self.reserved_pools = {}
         self.nextalloc = 0
 
+
 class IPAMReserveMarker(DataObject):
     _prefix = 'viperflow.dockerplugin.ipamreservemarker'
     _indices = ("cidr",)
+
 
 def _str(b, encoding = 'ascii'):
     if isinstance(b, str):
@@ -64,11 +69,12 @@ def _str(b, encoding = 'ascii'):
     else:
         return b.decode(encoding)
 
+
 def _routeapi(path):
     def decorator(func):
         @HttpHandler.route(path, method = [b'POST'])
         @functools.wraps(func)
-        def handler(self, env):
+        async def handler(self, env):
             try:
                 if b'content-type' in env.headerdict:
                     m = Message()
@@ -76,14 +82,12 @@ def _routeapi(path):
                     charset = m.get_content_charset('utf-8')
                 else:
                     charset = 'utf-8'
-                for m in env.inputstream.read(self):
-                    yield m
-                params = json.loads(_str(self.data, charset), encoding=charset)
+                data = await env.inputstream.read(self)
+                params = json.loads(_str(data, charset), encoding=charset)
                 self._logger.debug('Call %r with parameters: %r', path, params)
                 r = func(self, env, params)
                 if r is not None:
-                    for m in r:
-                        yield m
+                    await r
             except Exception as exc:
                 self._logger.warning('Docker API failed with exception', exc_info = True)
                 env.startResponse(500)
@@ -91,8 +95,10 @@ def _routeapi(path):
         return handler
     return decorator
 
+
 import subprocess
 import random
+
 
 def _create_veth(ip_command, prefix, mac_address, mtu):
     last_exc = None
@@ -119,12 +125,15 @@ def _create_veth(ip_command, prefix, mac_address, mtu):
     subprocess.check_call([ip_command, "link", "set", device_name + "-tap", "up"])
     return (device_name, mac_address)
 
+
 def _delete_veth(ip_command, device_name):
     subprocess.check_call([ip_command, "link", "del", device_name + "-tap"])
+
 
 def _plug_ovs(ovs_command, bridge_name, device_name, port_id):
     subprocess.check_call([ovs_command, "add-port", bridge_name, device_name+"-tap", "--",
                            "set", "interface", device_name+"-tap", "external_ids:iface-id=" + port_id])
+
 
 def _unplug_ovs(ovs_command, bridge_name, device_name):
     subprocess.check_call([ovs_command, "del-port", device_name+"-tap"])
@@ -184,7 +193,7 @@ class NetworkPlugin(HttpHandler):
         return removed_keys
     
     @_routeapi(br'/IpamDriver\.RequestPool')
-    def ipam_requestpool(self, env, params):
+    async def ipam_requestpool(self, env, params):
         if params['AddressSpace'] != _GLOBAL_SPACE:
             raise ValueError('Unsupported address space: must use this IPAM driver together with network driver')
         if params['V6']:
@@ -201,8 +210,7 @@ class NetworkPlugin(HttpHandler):
         new_pool.options = params['Options']
         if new_pool.pool:
             l = Lock(('dockerplugin_ipam_request_pool', new_pool.pool), self.scheduler)
-            for m in l.lock(self):
-                yield m
+            await l.lock(self)
         else:
             l = None
         try:
@@ -242,26 +250,22 @@ class NetworkPlugin(HttpHandler):
                         return (tuple(keys[0:2]) + (marker.getkey(),) + tuple(remove_keys),
                             (reservepool, reserve_new_pool, marker) + (None,) * len(remove_keys))
                 try:
-                    for m in callAPI(self, 'objectdb', 'transact', {'keys': (IPAMPoolReserve.default_key(),
+                    await call_api(self, 'objectdb', 'transact', {'keys': (IPAMPoolReserve.default_key(),
                                                                              new_pool.getkey()),
                                                                     'updater': _updater,
-                                                                    'withtime': True}):
-                        yield m
+                                                                    'withtime': True})
                 except IPAMUsingException:
                     # Wait for the CIDR to be released
                     self._reqid += 1
                     fail += 1
                     reqid = ('dockerplugin_ipam', self._reqid)
                     marker_key = IPAMReserveMarker.default_key(rets[0])
-                    for m in callAPI(self, 'objectdb', 'get', {'key': marker_key,
-                                                               'requestid': reqid,
-                                                               'nostale': True}):
-                        yield m
-                    retvalue = self.retvalue
-                    with watch_context([marker_key], [retvalue], reqid, self):
+                    with request_context(reqid, self):
+                        retvalue = await call_api(self, 'objectdb', 'get', {'key': marker_key,
+                                                                   'requestid': reqid,
+                                                                   'nostale': True})
                         if retvalue is not None and not retvalue.isdeleted():
-                            for m in self.executeWithTimeout(self.pooltimeout, retvalue.waitif(self, lambda x: x.isdeleted())):
-                                yield m
+                            await self.execute_with_timeout(self.pooltimeout, retvalue.waitif(self, lambda x: x.isdeleted()))
                 else:
                     env.outputjson({'PoolID': new_pool.id,
                                     'Pool': rets[0],
@@ -272,7 +276,7 @@ class NetworkPlugin(HttpHandler):
                 l.unlock()
             
     @_routeapi(br'/IpamDriver\.ReleasePool')
-    def ipam_releasepool(self, env, params):
+    async def ipam_releasepool(self, env, params):
         poolid = params['PoolID']
         def _updater(keys, values, timestamp):
             # There are two situations for Release Pool:
@@ -286,10 +290,9 @@ class NetworkPlugin(HttpHandler):
                 removed_keys.append(IPAMReserveMarker.default_key(reservepool.reserved_pools[poolid][0]))
                 del reservepool.reserved_pools[poolid]
             return ((keys[0],) + tuple(removed_keys), (values[0],) + (None,) * len(removed_keys))
-        for m in callAPI(self, 'objectdb', 'transact', {'keys': (IPAMPoolReserve.default_key(),),
+        await call_api(self, 'objectdb', 'transact', {'keys': (IPAMPoolReserve.default_key(),),
                                                         'updater': _updater,
-                                                        'withtime': True}):
-            yield m
+                                                        'withtime': True})
         env.outputjson({})
     
     def _remove_staled_ips(self, pool, timestamp):
@@ -297,109 +300,86 @@ class NetworkPlugin(HttpHandler):
                                  if ts is None or ts >= timestamp)
     
     @_routeapi(br'/IpamDriver\.RequestAddress')
-    def ipam_requestaddress(self, env, params):
+    async def ipam_requestaddress(self, env, params):
         poolid = params['PoolID']
         address = params['Address']
         if address:
             address = ip4_addr.formatter(ip4_addr(address))
         reserve_key = IPAMReserve.default_key(poolid)
         rets = []
-        def _updater(keys, values, timestamp):
-            pool = values[0]
-            if pool is None:
-                raise ValueError('PoolID %r does not exist' % (poolid,))
-            self._remove_staled_ips(pool, timestamp)
-            if len(values) > 1:
-                subnetmap = values[1]
-                if not hasattr(pool, 'subnetmap') or pool.subnetmap.getkey() != keys[1]:
-                    raise RetryUpdateException
-                subnet = values[2]
-            else:
-                subnetmap = None
-                if hasattr(pool, 'subnetmap'):
-                    raise RetryUpdateException
-            if address:
-                # check ip_address in cidr
-                if address in pool.reserved_ips:
-                    raise ValueError("IP address " + address + " has been reserved")
-                if pool.subpool:
-                    cidr = pool.subpool
-                else:
-                    cidr = pool.pool
-                network, mask = parse_ip4_network(cidr)
-                addr_num = ip4_addr(address)
-                if not ip_in_network(addr_num, network, mask):
-                    raise ValueError('IP address ' + address + " is not in the network CIDR")
-                if subnetmap is not None:
-                    start = ip4_addr(subnet.allocated_start)
-                    end = ip4_addr(subnet.allocated_end)
-                    try:
-                        assert start <= addr_num <= end
-                        if hasattr(subnet, 'gateway'):
-                            assert addr_num != ip4_addr(subnet.gateway)
-                    except Exception:
-                        raise ValueError("specified IP address " + address + " is not valid")
-    
-                    if str(addr_num) in subnetmap.allocated_ips:
-                        raise ValueError("IP address " + address + " has been used")
-                new_address = address
-            else:
-                # allocated ip_address from cidr
-                gateway = None
-                cidr = pool.pool
-                if pool.subpool:
-                    cidr = pool.subpool
-                network, prefix = parse_ip4_network(cidr)
-                start = network_first(network, prefix)
-                end = network_last(network, prefix)
-                if subnetmap is not None:
-                    start = max(start, ip4_addr(subnet.allocated_start))
-                    end = min(end, ip4_addr(subnet.allocated_end))
-                    if hasattr(subnet, "gateway"):
-                        gateway = ip4_addr(subnet.gateway)
-                for ip_address in range(start,end):
-                    new_address = ip4_addr.formatter(ip_address)
-                    if ip_address != gateway and \
-                        (subnetmap is None or str(ip_address) not in subnetmap.allocated_ips) and \
-                        new_address not in pool.reserved_ips:
-                        break
-                else:
-                    raise ValueError("No available IP address can be used")
-            pool.reserved_ips[new_address] = timestamp + self.iptimeout * 1000000
-            _, mask = parse_ip4_network(pool.pool)
-            rets[:] = [new_address + '/' + str(mask)]
-            return ((keys[0],), (pool,))
-        while True:
-            # First get the current data, to determine that whether the pool has already
-            # been connected to a network
-            self._reqid += 1
-            reqid = ('dockerplugin_ipam', self._reqid)
-            for m in callAPI(self, 'objectdb', 'get', {'key': reserve_key,
-                                                       'requestid': reqid,
-                                                       'nostale': True}):
-                yield m
-            reserve_pool = self.retvalue
-            with watch_context([reserve_key], [reserve_pool], reqid, self):
-                if reserve_pool is None or reserve_pool.isdeleted():
+        def walker(walk, write, timestamp):
+            with suppress(WalkKeyNotRetrieved):
+                pool = walk(reserve_key)
+                if pool is None:
                     raise ValueError('PoolID %r does not exist' % (poolid,))
-                if hasattr(reserve_pool, 'subnetmap'):
-                    # Retrieve both the reserve pool and the subnet map
-                    keys = (reserve_key, reserve_pool.subnetmap.getkey(), SubNet.default_key(reserve_pool.subnetmap.id))
+                self._remove_staled_ips(pool, timestamp)
+                if hasattr(pool, 'subnetmap'):
+                    subnetmap_key = pool.subnetmap.getkey()
+                    subnet_key = SubNetMap._subnet.rightkey(subnetmap_key)
+                    ensure_keys(walk, subnet_key, subnetmap_key)
+                    subnetmap = walk(subnetmap_key)
+                    subnet = walk(subnet_key)
                 else:
-                    keys = (reserve_key,)
-                try:
-                    for m in callAPI(self, 'objectdb', 'transact', {'keys': keys,
-                                                                    'updater': _updater,
-                                                                    'withtime': True}):
-                        yield m
-                except RetryUpdateException:
-                    continue
+                    subnetmap = None
+                    subnet = None
+                if address:
+                    # check ip_address in cidr
+                    if address in pool.reserved_ips:
+                        raise ValueError("IP address " + address + " has been reserved")
+                    if pool.subpool:
+                        cidr = pool.subpool
+                    else:
+                        cidr = pool.pool
+                    network, mask = parse_ip4_network(cidr)
+                    addr_num = ip4_addr(address)
+                    if not ip_in_network(addr_num, network, mask):
+                        raise ValueError('IP address ' + address + " is not in the network CIDR")
+                    if subnetmap is not None:
+                        start = ip4_addr(subnet.allocated_start)
+                        end = ip4_addr(subnet.allocated_end)
+                        try:
+                            assert start <= addr_num <= end
+                            if hasattr(subnet, 'gateway'):
+                                assert addr_num != ip4_addr(subnet.gateway)
+                        except Exception:
+                            raise ValueError("specified IP address " + address + " is not valid")
+        
+                        if str(addr_num) in subnetmap.allocated_ips:
+                            raise ValueError("IP address " + address + " has been used")
+                    new_address = address
                 else:
-                    env.outputjson({'Address': rets[0], 'Data': {}})
-                    break
+                    # allocated ip_address from cidr
+                    gateway = None
+                    cidr = pool.pool
+                    if pool.subpool:
+                        cidr = pool.subpool
+                    network, prefix = parse_ip4_network(cidr)
+                    start = network_first(network, prefix)
+                    end = network_last(network, prefix)
+                    if subnetmap is not None:
+                        start = max(start, ip4_addr(subnet.allocated_start))
+                        end = min(end, ip4_addr(subnet.allocated_end))
+                        if hasattr(subnet, "gateway"):
+                            gateway = ip4_addr(subnet.gateway)
+                    for ip_address in range(start,end):
+                        new_address = ip4_addr.formatter(ip_address)
+                        if ip_address != gateway and \
+                            (subnetmap is None or str(ip_address) not in subnetmap.allocated_ips) and \
+                            new_address not in pool.reserved_ips:
+                            break
+                    else:
+                        raise ValueError("No available IP address can be used")
+                pool.reserved_ips[new_address] = timestamp + self.iptimeout * 1000000
+                _, mask = parse_ip4_network(pool.pool)
+                rets[:] = [new_address + '/' + str(mask)]
+                write(pool.getkey(), pool)
+        await call_api(self, 'objectdb', 'writewalk', {'keys': (reserve_key,),
+                                                       'walker': walker,
+                                                       'withtime': True})
+        env.outputjson({'Address': rets[0], 'Data': {}})
     
     @_routeapi(br'/IpamDriver\.ReleaseAddress')
-    def ipam_releaseaddress(self, env, params):
+    async def ipam_releaseaddress(self, env, params):
         poolid = params['PoolID']
         address = params['Address']
         address = ip4_addr.formatter(ip4_addr(address))
@@ -411,10 +391,9 @@ class NetworkPlugin(HttpHandler):
             if address in pool.reserved_ips:
                 del pool.reserved_ips[address]
             return ((keys[0],), (pool,))
-        for m in callAPI(self, 'objectdb', 'transact', {'keys': (IPAMReserve.default_key(poolid),),
+        await call_api(self, 'objectdb', 'transact', {'keys': (IPAMReserve.default_key(poolid),),
                                                         'updater': _updater,
-                                                        'withtime': True}):
-            yield m
+                                                        'withtime': True})
         env.outputjson({})
         
     @HttpHandler.route(br'/NetworkDriver\.GetCapabilities', method = [b'POST'])
@@ -422,7 +401,7 @@ class NetworkPlugin(HttpHandler):
         env.outputjson({"Scope": "global"})
         
     @_routeapi(br'/NetworkDriver\.CreateNetwork')
-    def createnetwork(self, env, params):
+    async def createnetwork(self, env, params):
         lognet_id = 'docker-' + params['NetworkID'] + '-lognet'
         subnet_id = 'docker-' + params['NetworkID'] + '-subnet'
         network_params = {'id': lognet_id}
@@ -433,7 +412,7 @@ class NetworkPlugin(HttpHandler):
         if params['IPv4Data'] and params['IPv4Data'][0]['AddressSpace'] == _GLOBAL_SPACE:
             request_cidr = params['IPv4Data'][0]['Pool']
             docker_ipam_poolid = True
-            def _ipam_work():
+            async def _ipam_work():
                 # Using network driver together with IPAM driver
                 rets = []
                 def _ipam_stage(keys, values, timestamp):
@@ -449,23 +428,21 @@ class NetworkPlugin(HttpHandler):
                     del reservepool.reserved_pools[docker_ipam_poolid]
                     return ((keys[0],) + tuple(removed_keys), (reservepool,) + (None,) * len(removed_keys))
                 try:
-                    for m in callAPI(self, 'objectdb', 'transact', {'keys': (IPAMPoolReserve.default_key(),),
+                    await call_api(self, 'objectdb', 'transact', {'keys': (IPAMPoolReserve.default_key(),),
                                                                     'updater': _ipam_stage,
-                                                                    'withtime': True}):
-                        yield m
-                    self.retvalue = (True, rets[0])
+                                                                    'withtime': True})
+                    return (True, rets[0])
                 except Exception as exc:
-                    self.retvalue = (False, exc)
+                    return (False, exc)
                     
         else:
             docker_ipam_poolid = None
-        def _cleanup_ipam(docker_ipam_poolid):
+        async def _cleanup_ipam(docker_ipam_poolid):
             @updater
             def _remove_reserve(pool):
                 return (None,)
-            for m in callAPI(self, 'objectdb', 'transact', {'keys': (IPAMReserve.default_key(docker_ipam_poolid),),
-                                                            'updater': _remove_reserve}):
-                yield m
+            await call_api(self, 'objectdb', 'transact', {'keys': (IPAMReserve.default_key(docker_ipam_poolid),),
+                                                            'updater': _remove_reserve})
         if 'Options' in params and 'com.docker.network.generic' in params['Options']:
             for k,v in params['Options']['com.docker.network.generic'].items():
                 if k.startswith('subnet:'):
@@ -479,24 +456,21 @@ class NetworkPlugin(HttpHandler):
                         network_params[k] = v
                 else:
                     network_params[k] = v
-        def _create_lognet():
+        async def _create_lognet():
             try:
-                for m in callAPI(self, 'viperflow', 'createlogicalnetwork', network_params):
-                    yield m
+                await call_api(self, 'viperflow', 'createlogicalnetwork', network_params)
             except Exception as exc:
-                self.retvalue = exc
+                return exc
             else:
-                self.retvalue = None
+                return None
         if docker_ipam_poolid:
-            for m in self.executeAll([_ipam_work(),
-                                      _create_lognet()], self):
-                yield m
-            (((ipam_succ, ipam_result),), (create_lognet_exc,)) = self.retvalue
+            (ipam_succ, ipam_result), create_lognet_exc = \
+                    await self.execute_all([_ipam_work(),
+                                            _create_lognet()], self)
             if not ipam_succ:
                 if create_lognet_exc is None:
                     try:
-                        for m in callAPI(self, 'viperflow', 'deletelogicalnetwork', {'id': lognet_id}):
-                            yield m
+                        await call_api(self, 'viperflow', 'deletelogicalnetwork', {'id': lognet_id})
                     except Exception:
                         pass
                 raise ipam_result
@@ -505,7 +479,7 @@ class NetworkPlugin(HttpHandler):
                 raise create_lognet_exc
             else:
                 docker_ipam_poolid = ipam_result
-            def _ipam_work2():
+            async def _ipam_work2():
                 def _ipam_stage2(keys, values, timestamp):
                     pool = values[0]
                     pool.subnetmap = ReferenceObject(SubNetMap.default_key(subnet_id))
@@ -514,13 +488,11 @@ class NetworkPlugin(HttpHandler):
                         # Reserve forever
                         pool.reserved_ips[gateway] = None
                     return ((keys[0],), (pool,))
-                for m in callAPI(self, 'objectdb', 'transact', {'keys': (IPAMReserve.default_key(docker_ipam_poolid),),
+                await call_api(self, 'objectdb', 'transact', {'keys': (IPAMReserve.default_key(docker_ipam_poolid),),
                                                                 'updater': _ipam_stage2,
-                                                                'withtime': True}):
-                    yield m
+                                                                'withtime': True})
         else:
-            for m in _create_lognet():
-                yield m
+            await _create_lognet()
         subnet_params = {'logicalnetwork': lognet_id,
                         'cidr': params['IPv4Data'][0]['Pool'],
                         'id': subnet_id}
@@ -544,36 +516,35 @@ class NetworkPlugin(HttpHandler):
                         subnet_params[subnet_key] = v
         if docker_ipam_poolid is not None:
             subnet_params['docker_ipam_poolid'] = docker_ipam_poolid
-        def _create_subnet():
-            for m in callAPI(self, 'viperflow', 'createsubnet', subnet_params):
-                yield m
+        async def _create_subnet():
+            await call_api(self, 'viperflow', 'createsubnet', subnet_params)
         if docker_ipam_poolid:
             routines = [_ipam_work2(), _create_subnet()]
         else:
             routines = [_create_subnet()]
         try:
-            for m in self.executeAll(routines):
-                yield m
+            await self.execute_all(routines)
         except Exception as exc:
             if docker_ipam_poolid is not None:
                 self.subroutine(_cleanup_ipam(docker_ipam_poolid))
             try:
-                for m in callAPI(self, 'viperflow', 'deletelogicalnetwork', {'id': lognet_id}):
-                    yield m
+                await call_api(self, 'viperflow', 'deletesubnet', {'id': subnet_id})
             except Exception:
                 pass
-            raise exc        
+            try:
+                await call_api(self, 'viperflow', 'deletelogicalnetwork', {'id': lognet_id})
+            except Exception:
+                pass
+            raise exc
         env.outputjson({})
-        
+
     @_routeapi(br'/NetworkDriver\.DeleteNetwork')
-    def deletenetwork(self, env, params):
-        for m in callAPI(self, 'viperflow', 'deletesubnet', {'id': 'docker-' + params['NetworkID'] + '-subnet'}):
-            yield m
-        for m in callAPI(self, 'viperflow', 'deletelogicalnetwork', {'id': 'docker-' + params['NetworkID'] + '-lognet'}):
-            yield m
-            
+    async def deletenetwork(self, env, params):
+        await call_api(self, 'viperflow', 'deletesubnet', {'id': 'docker-' + params['NetworkID'] + '-subnet'})
+        await call_api(self, 'viperflow', 'deletelogicalnetwork', {'id': 'docker-' + params['NetworkID'] + '-lognet'})
+
     @_routeapi(br'/NetworkDriver\.CreateEndpoint')
-    def createendpoint(self, env, params):
+    async def createendpoint(self, env, params):
         lognet_id = 'docker-' + params['NetworkID'] + '-lognet'
         subnet_id = 'docker-' + params['NetworkID'] + '-subnet'
         logport_id = 'docker-' + params['EndpointID']
@@ -609,28 +580,24 @@ class NetworkPlugin(HttpHandler):
             mac_address = mac_addr_bytes.formatter(create_binary(mac_num, 6))
             logport_params['mac_address'] = mac_address
         try:
-            for m in callAPI(self, 'viperflow', 'createlogicalport', logport_params):
-                yield m
+            retvalue = await call_api(self, 'viperflow', 'createlogicalport', logport_params)
         except Exception as exc:
             # There is an issue that docker daemon may not delete an endpoint correctly
             # If autoremoveports is enabled, we remove the logical port automatically
             # Note that created veth and Openvswitch ports are not cleared because they
             # may not on this server, so you must clean them yourself with vlcp_docker.cleanup
             if self._parent.autoremoveports:
-                for m in callAPI(self, 'viperflow', 'listlogicalports', {'logicalnetwork': lognet_id,
-                                                                         'ip_address': ip}):
-                    yield m
-                if self.retvalue:
-                    if self.retvalue[0]['id'].startswith('docker-'):
-                        dup_pid = self.retvalue[0]['id']
+                retvalue = await call_api(self, 'viperflow', 'listlogicalports', {'logicalnetwork': lognet_id,
+                                                                                  'ip_address': ip})
+                if retvalue:
+                    if retvalue[0]['id'].startswith('docker-'):
+                        dup_pid = retvalue[0]['id']
                         self._logger.warning('Duplicated ports detected: %s (%s). Will remove it.',
                                                     dup_pid,
-                                                    self.retvalue[0]['ip_address'])
-                        for m in callAPI(self, 'viperflow', 'deletelogicalport', {'id': dup_pid}):
-                            yield m
+                                                    retvalue[0]['ip_address'])
+                        await call_api(self, 'viperflow', 'deletelogicalport', {'id': dup_pid})
                         # Retry create logical port
-                        for m in callAPI(self, 'viperflow', 'createlogicalport', logport_params):
-                            yield m
+                        retvalue = await call_api(self, 'viperflow', 'createlogicalport', logport_params)
                     else:
                         self._logger.warning('Duplicated with a non-docker port')
                         raise exc
@@ -638,13 +605,13 @@ class NetworkPlugin(HttpHandler):
                     raise exc
             else:
                 raise exc
-        ip_address = self.retvalue[0]['ip_address']
-        subnet_cidr = self.retvalue[0]['subnet']['cidr']
-        mtu = self.retvalue[0]['network'].get('mtu', self._parent.mtu)
+        ip_address = retvalue[0]['ip_address']
+        subnet_cidr = retvalue[0]['subnet']['cidr']
+        mtu = retvalue[0]['network'].get('mtu', self._parent.mtu)
         _, _, prefix = subnet_cidr.partition('/')
-        if 'docker_ipam_poolid' in self.retvalue[0]['subnet']:
-            docker_ipam_poolid = self.retvalue[0]['subnet']['docker_ipam_poolid']
-            def _remove_ip_reservation():
+        if 'docker_ipam_poolid' in retvalue[0]['subnet']:
+            docker_ipam_poolid = retvalue[0]['subnet']['docker_ipam_poolid']
+            async def _remove_ip_reservation():
                 try:
                     # The reservation is completed, remove the temporary reservation
                     def _ipam_updater(keys, values, timestamp):
@@ -653,38 +620,33 @@ class NetworkPlugin(HttpHandler):
                         if ip_address in pool.reserved_ips:
                             del pool.reserved_ips[ip_address]
                         return ((keys[0],), (pool,))
-                    for m in callAPI(self, 'objectdb', 'transact',
+                    await call_api(self, 'objectdb', 'transact',
                                      {'keys': (IPAMReserve.default_key(docker_ipam_poolid),),
                                       'updater': _ipam_updater,
-                                      'withtime': True}):
-                        yield m
+                                      'withtime': True})
                 except Exception:
                     self._logger.warning('Unexpected exception while removing reservation of IP address %r, will ignore and continue',
                                      ip_address, exc_info = True)
             self.subroutine(_remove_ip_reservation())
         port_created = False
         try:
-            for m in self._parent.taskpool.runTask(self, lambda: _create_veth(self._parent.ipcommand,
-                                                                             self._parent.vethprefix,
-                                                                             mac_address,
-                                                                             mtu)):
-                yield m
+            device_name, _ = await self._parent.taskpool.run_task(self, lambda: _create_veth(self._parent.ipcommand,
+                                                                         self._parent.vethprefix,
+                                                                         mac_address,
+                                                                         mtu))
             port_created = True
-            device_name, _ = self.retvalue
             info = DockerInfo.create_instance(logport_id)
             info.docker_port = device_name
             @updater
             def _updater(dockerinfo):
                 dockerinfo = set_new(dockerinfo, info)
                 return (dockerinfo,)
-            for m in callAPI(self, 'objectdb', 'transact', {'keys': (info.getkey(),),
-                                                            'updater': _updater}):
-                yield m
-            for m in self._parent.taskpool.runTask(self, lambda: _plug_ovs(self._parent.ovscommand,
+            await call_api(self, 'objectdb', 'transact', {'keys': (info.getkey(),),
+                                                            'updater': _updater})
+            await self._parent.taskpool.run_task(self, lambda: _plug_ovs(self._parent.ovscommand,
                                                                           self._parent.ovsbridge,
                                                                           device_name,
-                                                                          logport_id)):
-                yield m
+                                                                          logport_id))
             result = {'Interface': {}}
             if 'MacAddress' not in interface:
                 result['Interface']['MacAddress'] = mac_address
@@ -694,14 +656,12 @@ class NetworkPlugin(HttpHandler):
         except Exception as exc:
             try:
                 if port_created:
-                    for m in self._parent.taskpool.runTask(self, lambda: _delete_veth(self._parent.ipcommand,
-                                                                                      device_name)):
-                        yield m
+                    await self._parent.taskpool.run_task(self, lambda: _delete_veth(self._parent.ipcommand,
+                                                                                      device_name))
             except Exception:
                 pass
             try:
-                for m in callAPI(self, 'viperflow', 'deletelogicalport', {'id': logport_id}):
-                    yield m
+                await call_api(self, 'viperflow', 'deletelogicalport', {'id': logport_id})
             except Exception:
                 pass
             raise exc
@@ -711,15 +671,12 @@ class NetworkPlugin(HttpHandler):
         env.outputjson({'Value':{}})
         
     @_routeapi(br'/NetworkDriver\.DeleteEndpoint')
-    def delete_endpoint(self, env, params):
+    async def delete_endpoint(self, env, params):
         logport_id = 'docker-' + params['EndpointID']
-        for m in callAPI(self, 'dockerplugin', 'getdockerinfo', {'portid': logport_id}):
-            yield m
-        
-        # docker info will auto remove when logicalport remove , mget docker info will get None
-        if not self.retvalue or not self.retvalue[0]:
+        dockerinfo = await call_api(self, 'dockerplugin', 'getdockerinfo', {'portid': logport_id})
+        if not dockerinfo or not dockerinfo[0]:
             raise KeyError(repr(params['EndpointID']) + ' not found')
-        dockerinfo_result = self.retvalue[0]
+        dockerinfo_result = dockerinfo[0]
         docker_port = dockerinfo_result['docker_port']
         def _unplug_port(ovs_command = self._parent.ovscommand,
                          bridge_name = self._parent.ovsbridge,
@@ -733,19 +690,16 @@ class NetworkPlugin(HttpHandler):
                 _delete_veth(ip_command, device_name)
             except Exception:
                 self._logger.warning('Delete veth failed', exc_info = True)
-        for m in self._parent.taskpool.runTask(self, _unplug_port):
-            yield m
-        for m in callAPI(self, 'viperflow', 'deletelogicalport', {'id': logport_id}):
-            yield m
+        await self._parent.taskpool.run_task(self, _unplug_port)
+        await call_api(self, 'viperflow', 'deletelogicalport', {'id': logport_id})
         env.outputjson({})
         
     @_routeapi(br'/NetworkDriver\.Join')
-    def endpoint_join(self, env, params):
+    async def endpoint_join(self, env, params):
         logport_id = 'docker-' + params['EndpointID']
-        for m in self.executeAll([callAPI(self, 'viperflow', 'listlogicalports', {'id': logport_id}),
-                                  callAPI(self, 'dockerplugin', 'getdockerinfo', {'portid': logport_id})]):
-            yield m
-        ((logport_results,),(dockerinfo_results,)) = self.retvalue
+        logport_results, dockerinfo_results = \
+                await self.execute_all([call_api(self, 'viperflow', 'listlogicalports', {'id': logport_id}),
+                                        call_api(self, 'dockerplugin', 'getdockerinfo', {'portid': logport_id})])
         if not logport_results:
             raise KeyError(repr(params['EndpointID']) + ' not found')
         logport_result = logport_results[0]
@@ -781,13 +735,12 @@ class NetworkPlugin(HttpHandler):
             else:
                 dockerinfo.docker_sandbox = sandboxkey
                 return (dockerinfo,)
-        for m in callAPI(self, 'objectdb', 'transact', {'keys': [DockerInfo.default_key(logport_id)],
-                                                        'updater': _updater}):
-            yield m
+        await call_api(self, 'objectdb', 'transact', {'keys': [DockerInfo.default_key(logport_id)],
+                                                        'updater': _updater})
         env.outputjson(result)
         
     @_routeapi(br'/NetworkDriver\.Leave')
-    def endpoint_leave(self, env, params):
+    async def endpoint_leave(self, env, params):
         logport_id = 'docker-' + params['EndpointID']
         @updater
         def _updater(dockerinfo):
@@ -796,9 +749,8 @@ class NetworkPlugin(HttpHandler):
             else:
                 dockerinfo.docker_sandbox = None
                 return (dockerinfo,)
-        for m in callAPI(self, 'objectdb', 'transact', {'keys': [DockerInfo.default_key(logport_id)],
-                                                        'updater': _updater}):
-            yield m
+        await call_api(self, 'objectdb', 'transact', {'keys': [DockerInfo.default_key(logport_id)],
+                                                        'updater': _updater})
         env.outputjson({})
         
     @_routeapi(br'/NetworkDriver\.DiscoverNew')
@@ -853,36 +805,29 @@ class DockerPlugin(Module):
         self.apiroutine = RoutineContainer(self.scheduler)
         self._reqid = 0
         self.createAPI(api(self.getdockerinfo, self.apiroutine))
-    def load(self, container):
+
+    async def load(self, container):
         @updater
         def init_ipam(poolreserve):
             if poolreserve is None:
                 return (IPAMPoolReserve(),)
             else:
                 return ()
-        for m in callAPI(container, 'objectdb', 'transact', {'keys': (IPAMPoolReserve.default_key(),),
-                                                             'updater': init_ipam}):
-            yield m
-        for m in Module.load(self, container):
-            yield m
+        await call_api(container, 'objectdb', 'transact', {'keys': (IPAMPoolReserve.default_key(),),
+                                                             'updater': init_ipam})
+        await Module.load(self, container)
         
-    def _dumpkeys(self, keys):
+    async def _dumpkeys(self, keys):
         self._reqid += 1
         reqid = ('dockerplugin',self._reqid)
+        
+        with request_context(reqid, self.apiroutine):
+            retobjs = await call_api(self.apiroutine,'objectdb','mget',{'keys':keys,'requestid':reqid})
+            return [dump(v) for v in retobjs]
 
-        for m in callAPI(self.apiroutine,'objectdb','mget',{'keys':keys,'requestid':reqid}):
-            yield m
-
-        retobjs = self.apiroutine.retvalue
-
-        with watch_context(keys,retobjs,reqid,self.apiroutine):
-            self.apiroutine.retvalue = [dump(v) for v in retobjs]
-    def getdockerinfo(self, portid):
+    async def getdockerinfo(self, portid):
         "Get docker info for specified port"
         if not isinstance(portid, str) and hasattr(portid, '__iter__'):
-            for m in self._dumpkeys([DockerInfo.default_key(p) for p in portid]):
-                yield m
+            return await self._dumpkeys([DockerInfo.default_key(p) for p in portid])
         else:            
-            for m in self._dumpkeys([DockerInfo.default_key(portid)]):
-                yield m
-    
+            return await self._dumpkeys([DockerInfo.default_key(portid)])

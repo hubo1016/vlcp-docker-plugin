@@ -9,7 +9,7 @@ from vlcp.config import manager
 from vlcp.scripts.script import ScriptModule 
 import vlcp.service.sdn.viperflow as viperflow
 import vlcp.service.kvdb.objectdb as objectdb
-from vlcp.server.module import depend, callAPI
+from vlcp.server.module import depend, call_api
 from vlcp.utils.connector import TaskPool
 from vlcp.protocol.http import Http, HttpConnectionStateEvent
 import subprocess
@@ -22,6 +22,7 @@ from vlcp.event.connection import Client
 from vlcp.event.stream import MemoryStream
 import json
 import vlcp.utils.encoders as encoders
+from vlcp.event.event import M_
 try:
     from shlex import quote as shell_quote
 except:
@@ -38,7 +39,10 @@ _find_unused_veth = '''#/bin/bash
 '''
 
 def _bytes(s, encoding = 'ascii'):
-    return s.encode(encoding)
+    if isinstance(s, str):
+        return s.encode(encoding)
+    else:
+        return s
 
 def _str(s, encoding = 'utf-8'):
     if not isinstance(s, str):
@@ -66,7 +70,7 @@ class Cleanup(ScriptModule):
                ('skiplogicalport', None, False),
                ('host', 'H', True)
                )
-    def run(self, host = None, skipovs = None, skipiplink = None, skiplogicalport = None):
+    async def run(self, host = None, skipovs = None, skipiplink = None, skiplogicalport = None):
         skipovs = (skipovs is not None)
         skipiplink = (skipiplink is not None)
         skiplogicalport = (skiplogicalport is not None)
@@ -93,13 +97,13 @@ class Cleanup(ScriptModule):
             self._docker_conn.start()
             return self._docker_conn
         
-        def call_docker_api(path, data = None, method = None):
+        async def call_docker_api(path, data = None, method = None):
             if self._docker_conn is None or not self._docker_conn.connected:
                 _create_docker_conn()
                 conn_up = HttpConnectionStateEvent.createMatcher(HttpConnectionStateEvent.CLIENT_CONNECTED)
                 conn_noconn = HttpConnectionStateEvent.createMatcher(HttpConnectionStateEvent.CLIENT_NOTCONNECTED)
-                yield (conn_up, conn_noconn)
-                if self.apiroutine.matcher is conn_noconn:
+                _, m = await M_(conn_up, conn_noconn)
+                if m is conn_noconn:
                     raise IOError('Cannot connect to docker API endpoint: ' + repr(host))
             if method is None:
                 if data is None:
@@ -107,24 +111,24 @@ class Cleanup(ScriptModule):
                 else:
                     method = b'POST'
             if data is None:
-                for m in http_protocol.requestwithresponse(self.apiroutine,
-                                                           self._docker_conn,
-                                                           b'docker',
-                                                           _bytes(path),
-                                                           method,
-                                                           [(b'Accept-Encoding', b'gzip, deflate')]):
-                    yield m
+                final_resp, _ = await http_protocol.request_with_response(
+                                            self.apiroutine,
+                                            self._docker_conn,
+                                            b'docker',
+                                            _bytes(path),
+                                            method,
+                                            [(b'Accept-Encoding', b'gzip, deflate')]
+                                        )
             else:
-                for m in http_protocol.requestwithresponse(self.apiroutine,
-                                                           self._docker_conn,
-                                                           b'docker',
-                                                           _bytes(path),
-                                                           method,
-                                                           [(b'Content-Type', b'application/json;charset=utf-8'),
-                                                            (b'Accept-Encoding', b'gzip, deflate')],
-                                                           MemoryStream(_bytes(json.dumps(data)))):
-                    yield m
-            final_resp = self.apiroutine.http_finalresponse
+                final_resp, _ = await http_protocol.request_with_response(
+                                            self.apiroutine,
+                                            self._docker_conn,
+                                            b'docker',
+                                            _bytes(path),
+                                            method,
+                                            [(b'Content-Type', b'application/json;charset=utf-8'),
+                                             (b'Accept-Encoding', b'gzip, deflate')],
+                                            MemoryStream(_bytes(json.dumps(data))))
             output_stream = final_resp.stream
             try:
                 if final_resp.statuscode >= 200 and final_resp.statuscode < 300:
@@ -135,22 +139,21 @@ class Cleanup(ScriptModule):
                         elif ce.lower() == b'deflate':
                             output_stream.getEncoderList().append(encoders.deflate_decoder())
                     if output_stream is None:
-                        self.apiroutine.retvalue = {}
+                        return {}
                     else:
-                        for m in output_stream.read(self.apiroutine):
-                            yield m
-                        self.apiroutine.retvalue = json.loads(self.apiroutine.data.decode('utf-8'))
+                        data = await output_stream.read(self.apiroutine)
+                        return json.loads(data.decode('utf-8'))
                 else:
                     raise ValueError('Docker API returns error status: ' + repr(final_resp.status))
             finally:
                 if output_stream is not None:
                     output_stream.close(self.scheduler)
         
-        def execute_bash(script, ignoreerror = True):
+        async def execute_bash(script, ignoreerror = True):
             def task():
                 try:
                     sp = subprocess.Popen(['bash'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    outdata, errdata = sp.communicate(script)
+                    outdata, errdata = sp.communicate(_bytes(script))
                     sys.stderr.write(_str(errdata))
                     errno = sp.poll()
                     if errno != 0 and not ignoreerror:
@@ -167,8 +170,7 @@ class Cleanup(ScriptModule):
                                 sp.kill()
                         except Exception:
                             pass
-            for m in pool.runTask(self.apiroutine, task):
-                yield m
+            return await pool.run_task(self.apiroutine, task)
         
         ovsbridge = manager.get('module.dockerplugin.ovsbridge', 'dockerbr0')
         vethprefix = manager.get('module.dockerplugin.vethprefix', 'vlcp')
@@ -180,21 +182,17 @@ class Cleanup(ScriptModule):
         print("ovsbridge: ", ovsbridge)
         print("vethprefix: ", vethprefix)
         
-        def invalid_ovs_ports():
-            for m in execute_bash(find_invalid_ovs):
-                yield m
-            first_invalid_ovs_list = self.apiroutine.retvalue.splitlines(False)
+        async def invalid_ovs_ports():
+            result = await execute_bash(find_invalid_ovs)
+            first_invalid_ovs_list = result.splitlines(False)
             first_invalid_ovs_list = [k.strip() for k in first_invalid_ovs_list if k.strip()]
             if first_invalid_ovs_list:
                 print("Detect %d invalid ports from OpenvSwitch, wait 5 seconds to detect again..." % (len(first_invalid_ovs_list),))
             else:
-                self.apiroutine.retvalue = []
-                return
-            for m in self.apiroutine.waitWithTimeout(5):
-                yield m
-            for m in execute_bash(find_invalid_ovs):
-                yield m
-            second_invalid_ovs_list = self.apiroutine.retvalue.splitlines(False)
+                return []
+            await self.apiroutine.wait_with_timeout(5)
+            result = await execute_bash(find_invalid_ovs)
+            second_invalid_ovs_list = result.splitlines(False)
             second_invalid_ovs_list = [k.strip() for k in second_invalid_ovs_list if k.strip()]
             invalid_ports = list(set(first_invalid_ovs_list).intersection(second_invalid_ovs_list))
             if invalid_ports:
@@ -206,26 +204,20 @@ class Cleanup(ScriptModule):
                             _unplug_ovs(ovscommand, ovsbridge, p[:-len('-tag')])
                         except Exception as exc:
                             print('Remove port %r failed: %s' % (p, exc))
-                for m in pool.runTask(self.apiroutine, _remove_ports):
-                    yield m
-            self.apiroutine.retvalue = invalid_ports
-            return
+                await pool.run_task(self.apiroutine, _remove_ports)
+            return invalid_ports
         
-        def remove_unused_ports():
-            for m in execute_bash(find_unused_veth):
-                yield m
-            first_unused_ports = self.apiroutine.retvalue.splitlines(False)
+        async def remove_unused_ports():
+            result = await execute_bash(find_unused_veth)
+            first_unused_ports = result.splitlines(False)
             first_unused_ports = [k.strip() for k in first_unused_ports if k.strip()]
             if first_unused_ports:
                 print("Detect %d unused ports from ip-link, wait 5 seconds to detect again..." % (len(first_unused_ports),))
             else:
-                self.apiroutine.retvalue = []
-                return
-            for m in self.apiroutine.waitWithTimeout(5):
-                yield m
-            for m in execute_bash(find_unused_veth):
-                yield m
-            second_unused_ports = self.apiroutine.retvalue.splitlines(False)
+                return []
+            await self.apiroutine.wait_with_timeout(5)
+            result = await execute_bash(find_unused_veth)
+            second_unused_ports = result.splitlines(False)
             second_unused_ports = [k.strip() for k in second_unused_ports if k.strip()]
             unused_ports = list(set(first_unused_ports).intersection(second_unused_ports))
             if unused_ports:
@@ -241,79 +233,66 @@ class Cleanup(ScriptModule):
                             _delete_veth(ipcommand, p[:-len('-tag')])
                         except Exception as exc:
                             print('Delete port %r with ip-link failed: %s' % (p, exc))
-                for m in pool.runTask(self.apiroutine, _remove_ports):
-                    yield m
-            self.apiroutine.retvalue = unused_ports
-            return
+                await pool.run_task(self.apiroutine, _remove_ports)
+            return unused_ports
         
-        def detect_unused_logports():
+        async def detect_unused_logports():
             # docker network ls
             print("Check logical ports from docker API...")
-            for m in call_docker_api(br'/v1.24/networks?filters={"driver":["vlcp"]}'):
-                yield m
+            result = await call_docker_api(br'/v1.24/networks?filters={"driver":["vlcp"]}')
             network_ports = dict((n['Id'], dict((p['EndpointID'], p['IPv4Address'])
                                                for p in n['Containers'].values()))
-                            for n in self.apiroutine.retvalue
+                            for n in result
                             if n['Driver'] == 'vlcp')  # Old version of docker API does not support filter by driver
             print("Find %d networks and %d endpoints from docker API, recheck in 5 seconds..." % \
                     (len(network_ports), sum(len(ports) for ports in network_ports.values())))
-            def recheck_ports():
-                for m in self.apiroutine.waitWithTimeout(5):
-                    yield m
+            async def recheck_ports():
+                await self.apiroutine.wait_with_timeout(5)
                 # docker network inspect, use this for cross check
-                second_network_ports = {}
+                result = await call_docker_api(br'/v1.24/networks?filters={"driver":["vlcp"]}')
+                second_network_ports = dict((n['Id'], dict((p['EndpointID'], p['IPv4Address'])
+                                                   for p in n['Containers'].values()))
+                                            for n in result
+                                            if n['Id'] in network_ports and n['Driver'] == 'vlcp')
                 for nid in network_ports:
-                    try:
-                        for m in call_docker_api(br'/networks/' + _bytes(nid)):
-                            yield m
-                    except ValueError as exc:
-                        print('WARNING: check network failed, the network may be removed. Message: ', str(exc))
+                    if nid not in second_network_ports:
+                        print('WARNING: network {} may be removed.'.format(nid))
                         second_network_ports[nid] = {}
-                    else:
-                        second_network_ports[nid] = dict((p['EndpointID'], p['IPv4Address'])
-                                                         for p in self.apiroutine.retvalue['Containers'].values())
                 print("Recheck find %d endpoints from docker API" % \
                       (sum(len(ports) for ports in second_network_ports.values()),))
-                self.apiroutine.retvalue = second_network_ports
-            def check_viperflow():
+                return second_network_ports
+            async def check_viperflow():
                 first_vp_ports = {}
                 for nid in network_ports:
-                    for m in callAPI(self.apiroutine, 'viperflow', 'listlogicalports',
-                                     {'logicalnetwork': 'docker-' + nid + '-lognet'}):
-                        yield m
+                    result = await call_api(self.apiroutine, 'viperflow', 'listlogicalports',
+                                            {'logicalnetwork': 'docker-' + nid + '-lognet'})
                     first_vp_ports[nid] = dict((p['id'], p.get('ip_address'))
-                                                    for p in self.apiroutine.retvalue
+                                                    for p in result
                                                     if p['id'].startswith('docker-'))
                 print("Find %d endpoints from viperflow database, recheck in 5 seconds..." % \
                         (sum(len(ports) for ports in first_vp_ports.values()),))
-                for m in self.apiroutine.waitWithTimeout(5):
-                    yield m
+                await self.apiroutine.wait_with_timeout(5)
                 second_vp_ports = {}
                 for nid in network_ports:
-                    for m in callAPI(self.apiroutine, 'viperflow', 'listlogicalports',
-                                     {'logicalnetwork': 'docker-' + nid + '-lognet'}):
-                        yield m
+                    result = await call_api(self.apiroutine, 'viperflow', 'listlogicalports',
+                                            {'logicalnetwork': 'docker-' + nid + '-lognet'})
                     second_vp_ports[nid] = dict((p['id'], p.get('ip_address'))
-                                                    for p in self.apiroutine.retvalue
+                                                    for p in result
                                                     if p['id'] in first_vp_ports[nid])
                 print("Find %d endpoints from viperflow database from the intersection of two tries" % \
                         (sum(len(ports) for ports in second_vp_ports.values()),))
                 second_vp_ports = dict((nid, dict((pid[len('docker-'):], addr)
                                                   for pid, addr in v.items()))
                                        for nid, v in second_vp_ports.items())
-                self.apiroutine.retvalue = second_vp_ports
-            for m in check_viperflow():
-                yield m
-            second_vp_ports = self.apiroutine.retvalue
-            for m in recheck_ports():
-                yield m
-            second_ports = self.apiroutine.retvalue
+                return second_vp_ports
+            second_vp_ports = await check_viperflow()
+            second_ports = await recheck_ports()
             unused_logports = dict((nid, dict((pid, addr)
                                           for pid, addr in v.items()
                                           if pid not in network_ports[nid] and\
                                              pid not in second_ports[nid]))
                                 for nid, v in second_vp_ports.items())
-            self.apiroutine.retvalue = unused_logports
+            return unused_logports
         
         routines = []
         if not skipovs:
@@ -322,11 +301,10 @@ class Cleanup(ScriptModule):
             routines.append(remove_unused_ports())
         if not skiplogicalport:
             routines.append(detect_unused_logports())
-        for m in self.apiroutine.executeAll(routines):
-            yield m
+        execute_result = await self.apiroutine.execute_all(routines)
         if skiplogicalport:
             return
-        (unused_logports,) = self.apiroutine.retvalue[-1]
+        unused_logports = execute_result[-1]
         if any(ports for ports in unused_logports.values()):
             print("Find %d unused logical ports, first 20 ips:\n%r" % \
                   (sum(len(ports) for ports in unused_logports.values()),
@@ -335,14 +313,12 @@ class Cleanup(ScriptModule):
                             enumerate(addr for ports in unused_logports.values()
                                 for addr in ports.values()))]))
             print("Will remove them in 5 seconds, press Ctrl+C to cancel...")
-            for m in self.apiroutine.waitWithTimeout(5):
-                yield m
+            await self.apiroutine.wait_with_timeout(5)
             for ports in unused_logports.values():
                 for p, addr in ports.items():
                     try:
-                        for m in callAPI(self.apiroutine, 'viperflow', 'deletelogicalport',
-                                         {'id': 'docker-' + p}):
-                            yield m
+                        await call_api(self.apiroutine, 'viperflow', 'deletelogicalport',
+                                         {'id': 'docker-' + p})
                     except Exception as exc:
                         print("WARNING: remove logical port %r (IP: %s) failed, maybe it is already removed. Message: %s" % \
                                 (p, addr, exc))
