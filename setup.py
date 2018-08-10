@@ -23,5 +23,5 @@ setup(name='vlcp-docker-plugin',
       keywords=['SDN', 'VLCP', 'docker'],
       test_suite = 'tests',
       use_2to3=False,
-      install_requires = ["vlcp>=1.2.3"],
+      install_requires = ["vlcp==1.5.7"],
       packages=find_packages(exclude=("tests","tests.*","misc","misc.*")))
